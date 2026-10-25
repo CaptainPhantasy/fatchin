@@ -516,7 +516,9 @@ class FleetStore:
     def claim(self, slot):
         if type(slot) is not int or not 1 <= slot <= MAX_WORKERS:
             raise ValueError('Invalid agent slot.')
-        with self._locked(True) as data:
+        # Selection still holds the exclusive lock. Persist only an actual
+        # claim; idle pool checks must not rewrite the retained task history.
+        with self._locked() as data:
             provider = 'glm' if slot <= 10 else 'deepseek'
             active = [i for i in data['items'].values() if i['status'] == 'running']
             if len(active) >= MAX_WORKERS or any(i['slot'] == slot for i in active):
@@ -563,6 +565,7 @@ class FleetStore:
                 'status': 'running', 'provider': provider, 'stage': 'Starting', 'started_at': now(), 'heartbeat_at': now(),
                 'restarts': max(0, item['attempts'] - 1)}
             self._event(data, f"Agent {slot} started {item['kind'].replace('_', ' ')}.", item['id'], slot)
+            atomic_json(self.path, data)
             return {**copy.deepcopy(item), 'fleet': copy.deepcopy(data['fleets'][item['fleet_id']])}
 
     def fence(self, item_id, lease, reason='Agent reset requested.'):
