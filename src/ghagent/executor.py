@@ -28,6 +28,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import shutil
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -98,6 +99,35 @@ def _utcnow() -> str:
 
 def _safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+
+
+def cleanup_owned_checkout(ops, cfg: Config, job: Job, wt: str) -> None:
+    """Release one finished task's scratch, preserving uncertain publication.
+
+    Callers export results first. Standalone new-project repositories need
+    ordinary directory cleanup; linked Git worktrees use their Git registry.
+    No checkout outside the configured scratch root is eligible.
+    """
+    if job.notes.get('publish_outcome') == 'uncertain':
+        raise ValueError('Scratch retained because a GitHub write has an uncertain outcome')
+    root = Path(cfg.worktree_root).resolve()
+    path = Path(wt)
+    if path.is_symlink() or path.resolve().parent != root:
+        raise ValueError('Scratch ownership could not be established')
+    if job.notes.get('scratch_kind') == 'standalone':
+        expected = root / _safe_name(f'{job.kind.value}-{job.job_id}')
+        if (path.resolve(strict=True) != expected
+                or not (path / '.git').is_dir()
+                or (path / '.git').is_symlink()):
+            raise ValueError('Standalone scratch ownership could not be established')
+        shutil.rmtree(path)
+    else:
+        if (path / '.git').is_dir():
+            raise ValueError('An ordinary repository cannot be removed as a linked worktree')
+        ops.remove_worktree(wt)
+        ops.prune()
+    job.notes.pop('worktree_path', None)
+    job.notes.pop('worktree_cleanup', None)
 
 
 def _is_not_found(exc: BaseException) -> bool:
@@ -660,6 +690,7 @@ class JobExecutor:
                           "-c", "user.email=gha-worker@inference",
                           "commit", "--allow-empty", "-q", "-m", "start"], cwd=path)
                 wt = path
+                job.notes['scratch_kind'] = 'standalone'
             except Exception as exc:
                 return self._fail(job, f"scratch folder setup failed: {_short(exc)}")
         else:
@@ -718,6 +749,7 @@ class JobExecutor:
                           "-c", "user.email=gha-worker@inference",
                           "commit", "--allow-empty", "-q", "-m", "start"], cwd=path)
                 wt = path
+                job.notes['scratch_kind'] = 'standalone'
             except Exception as exc:
                 return self._fail(job, f"scratch folder setup failed: {_short(exc)}")
         else:
@@ -861,15 +893,18 @@ class JobExecutor:
         )
 
     def _cleanup_worktree(self, job: Job, wt: str) -> None:
+        if job.notes.get('publish_outcome') == 'uncertain':
+            self._export_worktree(job, wt)
+            job.notes['worktree_cleanup'] = ('Scratch retained: a GitHub write has an uncertain outcome. '
+                                             'Reconcile the recorded branch and commit before recovery.')
+            return
         if not self._export_worktree(job, wt):
             job.notes['worktree_cleanup'] = 'Scratch retained because result export failed. Correct the destination access before recovery.'
             return
         try:
-            self._ops().remove_worktree(wt)
-            self._ops().prune()
-            job.notes.pop("worktree_path", None)
-        except Exception:
-            job.notes["worktree_cleanup"] = f"failed for {wt}"
+            cleanup_owned_checkout(self._ops(), self.cfg, job, wt)
+        except Exception as exc:
+            job.notes["worktree_cleanup"] = f"failed for {wt}: {_short(exc)}"
 
     def _export_worktree(self, job: Job, wt: str) -> bool:
         if not job.notes.get("output_dir"):
@@ -986,21 +1021,69 @@ class JobExecutor:
 
     # -- VERIFYING ------------------------------------------------------------
 
+    def _verify_candidate(self, job: Job, wt: str):
+        """Commit first, then check and inventory the exact publish candidate.
+
+        Agent declarations are useful narrative, never proof that commands ran
+        or that a review thread's file changed. All evidence here is local.
+        """
+        from .coding_agent import CodingAgent
+        from .github_client import redact_text
+        from .task_write_guard import commit_id, ensure_prepared_tree
+
+        message = f"gha-worker {job.kind.value} #{job.number} ({job.job_id})"
+        self._ops().commit_all(wt, message)
+        tested = commit_id(_run_git, wt, 'HEAD')
+        tree = commit_id(_run_git, wt, 'HEAD^{tree}')
+        ensure_prepared_tree(_run_git, wt, tree)
+        if not job.started_commit:
+            raise ValueError('Starting commit unknown; changed files cannot be verified')
+        rc, out, err = _run_git(['diff', '--name-only', '-z',
+                                 job.started_commit, tested, '--'], cwd=wt)
+        if rc:
+            raise ValueError('Changed files could not be read from Git')
+        job.notes['changed_files'] = [p for p in out.split('\0') if p]
+        job.notes['candidate_commit'] = tested if tested != job.started_commit else ''
+        job.notes['tested_base'] = tested
+        job.notes['tested_commit'] = tested
+        job.notes['tested_tree'] = tree
+        runner = CodingAgent(None, self.cfg)
+        runner._active_worktree = wt
+        configured = self._repo_checks(job)
+        checks = runner._run_checks(configured, lambda: self._stopped(job.job_id))
+        job.notes['checks'] = [{**c, 'command': redact_text(str(c.get('command', ''))),
+                                'output_tail': redact_text(str(c.get('output_tail', '')))}
+                               for c in checks]
+        if self._stopped(job.job_id):
+            raise ValueError('Task stopped before verification completed')
+        if len(checks) != len(configured) or any(c.get('passed') is not True for c in checks):
+            failed = next((str(c.get('command')) for c in checks
+                           if c.get('passed') is not True), 'missing check result')
+            job.notes['verification'] = f'Configured checks failed: {redact_text(failed)}'
+            raise ValueError(job.notes['verification'])
+        current = ensure_prepared_tree(_run_git, wt, tree)
+        if current != tested:
+            raise ValueError('The candidate commit changed during verification')
+        note = (f'all {len(checks)} configured checks passed on the candidate commit'
+                if configured else 'no repo checks configured; verification is local-tests-only '
+                '(never claimed as passing checks)')
+        job.notes['verification'] = note
+        return (True if configured else None), note, tested
+
+    def _confirm_candidate(self, job: Job, wt: str, tested: str) -> None:
+        from .task_write_guard import ensure_prepared_tree
+        if ensure_prepared_tree(_run_git, wt, job.notes.get('tested_tree', '')) != tested:
+            raise ValueError('The candidate commit changed after verification; nothing was pushed')
+
     def _verifying(self, job: Job, result, wt: str):
-        checks_pass, note = evaluate_verification(self._repo_checks(job), result)
-        tested = ""
         try:
-            tested = str(self._ops().current_sha(wt) or "")
-        except Exception:
-            tested = ""
-        if not tested:
-            tested = str(getattr(result, "final_commit_sha", "") or "")
-        job.notes["tested_base"] = tested
-        job.notes["verification"] = note
-        if checks_pass is False:
-            self._fail(job, f"verification failed: {note}")
+            return self._verify_candidate(job, wt)
+        except Exception as exc:
+            if self._stopped(job.job_id):
+                self._halt_stopped(job)
+            else:
+                self._fail(job, f'verification failed: {_short(exc, 350)}')
             return None
-        return checks_pass, note, tested
 
     # -- RESPONDING -----------------------------------------------------------
 
@@ -1050,14 +1133,12 @@ class JobExecutor:
                 return self._fail(
                     job, f"remote moved; re-run to rebase (branch {branch} already exists)")
 
-        # (c) commit + explicit, never-forced push.
-        ops = self._ops()
-        message = f"gha-worker {job.kind.value} #{job.number} ({job.job_id})"
-        produced = ""
+        # (c) Publish only the candidate commit that passed verification.
+        produced = str(job.notes.get('candidate_commit') or '')
         try:
-            produced = str(ops.commit_all(wt, message) or "")
+            self._confirm_candidate(job, wt, tested)
         except Exception as exc:
-            return self._fail(job, f"commit failed: {_short(exc)}")
+            return self._fail(job, f'verified candidate changed: {_short(exc)}')
         self._persist(job)  # persist BEFORE the remote write
         if self._stopped(job.job_id):
             return self._halt_stopped(job)
@@ -1067,8 +1148,11 @@ class JobExecutor:
         if produced and not target_branch:
             return self._fail(job, "no push target branch could be determined")
         if produced:
+            job.notes['publish_outcome'] = 'uncertain'
+            job.notes['publish_branch'] = target_branch
+            self._persist(job)  # A timeout or crash must retain reconciliation evidence.
             rc, out, err = _run_git(
-                ["push", PUSH_REMOTE, f"HEAD:refs/heads/{target_branch}"],
+                ["push", PUSH_REMOTE, f"{tested}:refs/heads/{target_branch}"],
                 cwd=wt, timeout=self.cfg.run_command_timeout_seconds)
             if rc != 0:
                 # Uncertain or failed write: verify by re-reading before any retry.
@@ -1076,6 +1160,7 @@ class JobExecutor:
                 if not (known and remote_sha == produced):
                     return self._fail(job,
                                       f"git push failed (rc={rc}): {_clip(err or out, 300)}")
+            job.notes['publish_outcome'] = 'confirmed'
             job.produced_commits.append(produced)
             self._persist(job)  # persist AFTER the remote write
             # Sweep immediately: the review run starts the moment the push
@@ -1100,7 +1185,7 @@ class JobExecutor:
         unlinked_threads: list[dict] = []
         if is_fix:
             self._respond_threads(job, context, result, produced,
-                                  checks_pass, unlinked_threads)
+                                  checks_pass if not refusal else None, unlinked_threads)
             if job.state is JobState.FAILED:
                 return job
             if self._stopped(job.job_id):
@@ -1191,7 +1276,7 @@ class JobExecutor:
         """Inline replies via numeric root ids; resolve only with full evidence."""
         repo = job.repo_full_name
         threads = [t for t in (context.get("threads") or []) if not t.get("isResolved")]
-        changed = set(getattr(result, "changed_files", None) or [])
+        changed = set(job.notes.get('changed_files') or [])
         fix_at = ""
         gates_used = 0
         for t in threads:
@@ -1273,6 +1358,8 @@ class JobExecutor:
                 f"Verification: {job.notes.get('verification', '')}\n"
                 f"Tested commit: {tested}\n")
         path = responder._write_temp(body)
+        job.notes['publish_outcome'] = 'uncertain'
+        self._persist(job)
         try:
             rc, out, err = responder._run_gh(
                 ["pr", "create", "--repo", repo, "--base", base, "--head", branch,
@@ -1291,6 +1378,7 @@ class JobExecutor:
         info = {"number": int(m.group(1)),
                 "url": _clip(out.strip().splitlines()[-1] if out.strip() else "", 200)}
         job.notes["created_pr"] = info
+        job.notes['publish_outcome'] = 'confirmed'
         self._persist(job)
         return info
 
