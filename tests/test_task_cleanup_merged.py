@@ -7,6 +7,7 @@ that writes the draft, and no network, model, or real repository is touched.
 from __future__ import annotations
 
 import tempfile
+import subprocess
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -28,6 +29,7 @@ NOTES = ("Sending the contact form now retries once when the first attempt "
          "fails, so a short network blip no longer loses the message.\n\n"
          "Nothing changes on screen; the confirmation still says sent.")
 TAG_VALUE = "v1.4.0"
+HEAD_SHA = "a" * 40
 
 
 def merged_pull(body="Closes #7 and fixes #8.\n\nAlso mentions #9.",
@@ -36,7 +38,7 @@ def merged_pull(body="Closes #7 and fixes #8.\n\nAlso mentions #9.",
     return {"number": NUMBER, "title": "Retry the contact form once",
             "state": state or ("closed" if merged else "open"),
             "merged": merged, "body": body,
-            "head": {"ref": head, "repo": {"full_name": REPO}},
+            "head": {"ref": head, "sha": HEAD_SHA, "repo": {"full_name": REPO}},
             "base": {"ref": base, "repo": {"full_name": REPO}}}
 
 
@@ -50,6 +52,7 @@ class RecordingGH:
         self.linked_issues = [7, 8]
         self.default_branch = "main"
         self.graphql_error = None
+        self.branch_sha = HEAD_SHA
 
     def graphql(self, query, variables=None):
         if self.graphql_error:
@@ -73,6 +76,8 @@ class RecordingGH:
             return self.pull
         if method == "POST" and path == f"repos/{REPO}/releases":
             return {"tag_name": (body or {}).get("tag_name")}
+        if method == "GET" and "/git/ref/heads/" in path:
+            return {"object": {"sha": self.branch_sha}}
         return {}
 
     def writes(self):
@@ -248,6 +253,9 @@ class DraftExecutionTests(unittest.TestCase):
 
 
 class ApplyTests(unittest.TestCase):
+    def setUp(self):
+        self.delete = self.enterContext(patch.object(cleanup_merged, "_push_branch_delete"))
+
     def run_apply(self, gh=None, context=None, job=None):
         gh = gh or RecordingGH()
         outcome = cleanup_merged.TASK.apply(context or draft_context(), gh,
@@ -264,8 +272,8 @@ class ApplyTests(unittest.TestCase):
              "body": {"state": "closed"}, "paginate": False},
             {"method": "PATCH", "path": f"repos/{REPO}/issues/8",
              "body": {"state": "closed"}, "paginate": False},
-            {"method": "DELETE",
-             "path": f"repos/{REPO}/git/refs/heads/feature/contact-form",
+            {"method": "GET",
+             "path": f"repos/{REPO}/git/ref/heads/feature/contact-form",
              "body": None, "paginate": False},
             {"method": "POST", "path": f"repos/{REPO}/releases",
              "body": {"tag_name": TAG_VALUE, "name": TITLE, "body": NOTES},
@@ -274,6 +282,16 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual(outcome, {"result": (
             f"Closed 2 issue(s), deleted the merged branch, published release "
             f"{TAG_VALUE}.")})
+        self.assertEqual(self.delete.call_args.args[1:],
+                         (REPO, "feature/contact-form", HEAD_SHA))
+
+    def test_advanced_remote_branch_is_retained_before_delete(self):
+        gh = RecordingGH()
+        gh.branch_sha = "b" * 40
+        outcome, _ = self.run_apply(gh=gh)
+        self.delete.assert_not_called()
+        self.assertIn("source branch changed", outcome["result"])
+        self.assertIn("delete it yourself", outcome["result"])
 
     def test_fork_or_unknown_head_repository_never_deletes_a_base_branch(self):
         for source in ({"full_name": "contributor/repo"}, None, {}):
@@ -295,6 +313,7 @@ class ApplyTests(unittest.TestCase):
         gh = RecordingGH(pull=merged_pull(base="release"))
         self.run_apply(gh=gh)
         self.assertFalse([c for c in gh.calls if c["method"] == "PATCH"])
+        self.delete.assert_not_called()
 
     def test_unreadable_closing_evidence_stops_before_any_write(self):
         gh = RecordingGH()
@@ -410,7 +429,7 @@ class ApplyTests(unittest.TestCase):
         self.assertIn("Closed 1 issue(s)", outcome["result"])
         self.assertIn("#7 could not be closed", outcome["result"])
         self.assertIn("published release", outcome["result"])
-        self.assertIn(f"repos/{REPO}/git/refs/heads/feature/contact-form",
+        self.assertIn(f"repos/{REPO}/git/ref/heads/feature/contact-form",
                       [c["path"] for c in gh.calls])
 
     def test_missing_title_refuses_before_any_remote_call(self):
@@ -437,6 +456,7 @@ class PostThroughWebControlTests(GuiFixture, unittest.TestCase):
         self.gh_recorder = RecordingGH()
         self.control.gh = self.gh_recorder
         tasks.types._REGISTRY = None
+        self.enterContext(patch.object(cleanup_merged, "_push_branch_delete"))
 
     def tearDown(self):
         tasks.types._REGISTRY = None
@@ -469,7 +489,7 @@ class PostThroughWebControlTests(GuiFixture, unittest.TestCase):
         self.assertEqual(result["job"]["state"], "done")
         self.assertIn(f"published release {TAG_VALUE}", result["hint"])
         self.assertEqual([c["method"] for c in self.gh_recorder.calls],
-                         ["GET", "PATCH", "PATCH", "DELETE", "POST"])
+                         ["GET", "PATCH", "PATCH", "GET", "POST"])
 
     def test_an_unmerged_pull_request_reads_as_a_hint_not_a_crash(self):
         self.waiting_job()
@@ -482,6 +502,51 @@ class PostThroughWebControlTests(GuiFixture, unittest.TestCase):
         self.assertEqual(self.gh_recorder.writes(), [])
         job = self.control.queue().get("job_cleanup")
         self.assertEqual(job.state, JobState.WAITING_ON_YOU)
+
+
+class ConditionalDeletionTests(unittest.TestCase):
+    def test_real_remote_deletion_preserves_a_branch_that_advances_during_cleanup(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            remote, checkout = root / "remote.git", root / "checkout"
+            checkout.mkdir()
+            run = subprocess.run
+            def git(*args, cwd=checkout):
+                return run(["git", *args], cwd=cwd, check=True,
+                           capture_output=True, text=True).stdout.strip()
+            git("init", "--bare", "-q", str(remote))
+            git("init", "-q")
+            git("config", "user.name", "Cleanup test")
+            git("config", "user.email", "cleanup-test@example.invalid")
+            git("commit", "--allow-empty", "-qm", "Reviewed commit")
+            expected = git("rev-parse", "HEAD")
+            ref = "refs/heads/fix/login"
+            git("push", str(remote), f"HEAD:{ref}")
+            advanced = None
+            def local_transport(argv, **kwargs):
+                nonlocal advanced
+                if argv[:2] == ["git", "push"]:
+                    self.assertIn(f"--force-with-lease={ref}:{expected}", argv)
+                    self.assertIn("--delete", argv)
+                    self.assertEqual(argv[-2:], ["https://github.com/owner/repo.git", ref])
+                    if advance_on_push:
+                        git("commit", "--allow-empty", "-qm", "Later independent work")
+                        advanced = git("rev-parse", "HEAD")
+                        git("push", str(remote), f"HEAD:{ref}")
+                    argv = [*argv[:-2], str(remote), ref]
+                return run(argv, **kwargs)
+            advance_on_push = False
+            with patch.object(cleanup_merged.subprocess, "run", local_transport):
+                cleanup_merged._push_branch_delete(str(checkout), REPO, "fix/login", expected)
+            missing = run(["git", "show-ref", "--verify", ref], cwd=remote,
+                          capture_output=True, text=True)
+            self.assertNotEqual(missing.returncode, 0)
+            git("push", str(remote), f"{expected}:{ref}")
+            advance_on_push = True
+            with patch.object(cleanup_merged.subprocess, "run", local_transport), \
+                    self.assertRaisesRegex(ValueError, "refused the conditional"):
+                cleanup_merged._push_branch_delete(str(checkout), REPO, "fix/login", expected)
+            self.assertEqual(git("rev-parse", ref, cwd=remote), advanced)
 
 
 if __name__ == "__main__":

@@ -9,9 +9,14 @@ and the base branch and fork branches are never touched.
 """
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+from urllib.parse import quote
 
 from .types import TaskType
+from ..github_client import redact_text
+from ..task_write_guard import ensure_not_stopped
 
 DRAFT_DIR = ".gha-drafts"
 DRAFT_FILE = ".gha-drafts/release-notes.md"
@@ -60,7 +65,7 @@ def _is_merged(pull: dict) -> bool:
     return bool(merged or state == "MERGED")
 
 
-def _closing_issues(gh, repo: str, pull_number: int) -> list[int]:
+def _closing_issues(gh, repo: str, pull_number: int) -> tuple[list[int], bool]:
     """Read GitHub's closing links, never infer permission from body mentions.
 
     A merge into a release/feature branch does not close the linked issues.
@@ -82,7 +87,7 @@ def _closing_issues(gh, repo: str, pull_number: int) -> list[int]:
             if pull.get("merged") is not True or not default or not pull.get("baseRefName"):
                 raise ValueError("Missing merged pull request evidence")
             if pull["baseRefName"] != default:
-                return []
+                return [], False
             references = pull.get("closingIssuesReferences") or {}
             nodes, page = references.get("nodes"), references.get("pageInfo")
             if not isinstance(nodes, list) or not isinstance(page, dict):
@@ -97,7 +102,7 @@ def _closing_issues(gh, repo: str, pull_number: int) -> list[int]:
                 if issue_repo.casefold() == repo.casefold() and number not in numbers:
                     numbers.append(number)
             if not page["hasNextPage"]:
-                return numbers
+                return numbers, True
             cursor = page.get("endCursor")
             if not cursor or cursor in seen or len(seen) >= 99:
                 raise ValueError("Incomplete linked issue pagination")
@@ -106,6 +111,38 @@ def _closing_issues(gh, repo: str, pull_number: int) -> list[int]:
         raise ValueError("The pull request's closing issue links could not be verified. "
                          "Nothing was changed on GitHub; try again when GitHub can "
                          "provide the complete merge details.") from None
+
+
+def _push_branch_delete(worktree: str, repo: str, head: str, expected: str) -> None:
+    """Delete only if receive-pack still sees the merged PR's exact head.
+
+    REST DELETE has no expected-old-SHA condition. This explicit lease does:
+    even a branch advancing after our REST read cannot be deleted. There is no
+    new commit or branch-history rewrite in this push, only one conditional
+    deletion. Authentication uses the worker's existing git credential helper.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+", repo):
+        raise ValueError("The repository identity could not be verified.")
+    if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", expected):
+        raise ValueError("The merged branch's commit could not be verified.")
+    if not worktree or not os.path.isdir(worktree):
+        raise ValueError("The scratch checkout is unavailable.")
+    ref = f"refs/heads/{head}"
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    try:
+        check = subprocess.run(["git", "check-ref-format", ref], cwd=worktree,
+                               capture_output=True, text=True, timeout=15, env=env)
+        if check.returncode != 0:
+            raise ValueError("The source branch name is not a valid branch.")
+        proc = subprocess.run(
+            ["git", "push", f"--force-with-lease={ref}:{expected}", "--delete",
+             f"https://github.com/{repo}.git", ref], cwd=worktree,
+            capture_output=True, text=True, timeout=120, env=env)
+    except (OSError, subprocess.TimeoutExpired):
+        raise ValueError("Git could not confirm the conditional branch deletion.") from None
+    if proc.returncode != 0:
+        raise ValueError("Git refused the conditional branch deletion: "
+                         + _clip(redact_text(proc.stderr or proc.stdout)))
 
 
 def _tag_taken(exc: BaseException) -> bool:
@@ -205,7 +242,7 @@ def apply(context: dict, gh, job) -> dict:
 
     head = str((pull.get("head") or {}).get("ref") or "").strip()
     base = str((pull.get("base") or {}).get("ref") or "").strip()
-    references = _closing_issues(gh, repo, number)
+    references, default_merge = _closing_issues(gh, repo, number)
     head_repo = ((pull.get("head") or {}).get("repo") or {}).get("full_name")
 
     closed: list[int] = []
@@ -219,6 +256,7 @@ def apply(context: dict, gh, job) -> dict:
             failed.append((issue, _clip(exc)))
 
     deleted = False
+    deletion_attempted = False
     branch_note = ""
     if not head:
         branch_note = " The pull request does not name its head branch, so no branch was deleted."
@@ -228,19 +266,34 @@ def apply(context: dict, gh, job) -> dict:
     elif head in PROTECTED_BRANCHES or head == base:
         branch_note = (f" Its head was {head}, a branch this task never deletes, "
                        "so the branch was left alone.")
+    elif not default_merge:
+        branch_note = " It did not merge into the default branch, so no branch was deleted."
     else:
         try:
-            gh.rest("DELETE", f"repos/{repo}/git/refs/heads/{head}")
+            expected = str((pull.get("head") or {}).get("sha") or "")
+            if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", expected):
+                raise ValueError("The pull request's merged head commit is missing.")
+            current = gh.rest("GET", f"repos/{repo}/git/ref/heads/{quote(head, safe='/')}") or {}
+            if (current.get("object") or {}).get("sha") != expected:
+                raise ValueError("The source branch changed after this pull request.")
+            saved = getattr(job, "notes", None) or {}
+            worktree = context.get("worktree") or saved.get("worktree_path") or saved.get("worktree")
+            ensure_not_stopped(context)
+            context['_github_write_attempted'] = True
+            deletion_attempted = True
+            _push_branch_delete(str(worktree or ""), repo, head, expected)
             deleted = True
         except Exception as exc:
-            branch_note = (f" The merged branch {head} could not be deleted "
-                           f"(gh said: {_clip(exc)}).")
+            branch_note = (f" Deletion of the merged branch {head} was not confirmed: "
+                           f"{_clip(exc)} Review its current state and delete it yourself "
+                           "on the pull request's GitHub page if appropriate.")
 
     if failed:
         listed = ", ".join(f"#{issue}" for issue, _ in failed)
         branch_note += (f" {listed} could not be closed (gh said: "
                         f"{failed[0][1]}).")
     branch_text = ("deleted the merged branch" if deleted
+                   else "did not confirm deletion of the merged branch" if deletion_attempted
                    else "left the merged branch alone")
 
     try:
