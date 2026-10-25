@@ -768,6 +768,13 @@ class JobExecutor:
                    "base_branch": base, "values": job.notes.get("values") or {},
                    "title": job.notes.get("title", ""),
                    "number": job.number, "job_id": job.job_id}
+        if job.kind is JobKind.SYNC_BRANCH:
+            try:
+                from .tasks.sync_branch import prepare_plan
+                prepare_plan(context, self.gh, job)
+                self._persist(job)
+            except Exception as exc:
+                return self._fail(job, f'Branch plan preparation failed: {_short(exc)}')
         instruction = (task.build_instruction(context) if callable(task.build_instruction)
                        else self._default_report_instruction(task, job, context))
         instruction += ("\n\nWrite every candidate text you want the person to "

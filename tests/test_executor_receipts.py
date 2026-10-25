@@ -210,6 +210,47 @@ class ExecutorReceiptTests(unittest.TestCase):
         self.assertFalse(expected.exists())
         self.assertNotIn('worktree_path', self.job.notes)
 
+    def test_sync_plan_is_prepared_and_saved_before_agent_instruction(self):
+        from ghagent.tasks import sync_branch
+        self.job.kind = JobKind.SYNC_BRANCH
+        draft = self.checkout / '.gha-drafts'
+        draft.mkdir()
+        (draft / 'plan.md').write_text('Plan\nInspect the pinned branches.\n')
+        self.exe._worktree_ops = SimpleNamespace(add_worktree=lambda *args: str(self.checkout))
+        events = []
+        def prepare(context, gh, job):
+            events.append('prepare')
+            job.notes['planned_refs'] = {'refs/heads/main': self.baseline}
+        persist = self.exe._persist
+        def saved(job, state=None, error=''):
+            if 'planned_refs' in job.notes:
+                events.append('saved')
+            persist(job, state, error)
+        def instruction(context):
+            self.assertIn('saved', events)
+            events.append('instruction')
+            return 'Explain pinned commits'
+        task = SimpleNamespace(id='sync-branch', takes='repo', build_instruction=instruction)
+        with patch.object(sync_branch, 'prepare_plan', side_effect=prepare, create=True), \
+                patch.object(self.exe, '_persist', side_effect=saved), \
+                patch.object(self.exe, '_run_agent', return_value=self.result):
+            self.exe._execute_drafts(self.job, task)
+        self.assertEqual(self.job.state, JobState.WAITING_ON_YOU, self.job.error)
+        self.assertLess(events.index('prepare'), events.index('saved'))
+        self.assertLess(events.index('saved'), events.index('instruction'))
+
+    def test_sync_plan_preparation_failure_stops_before_agent(self):
+        from ghagent.tasks import sync_branch
+        self.job.kind = JobKind.SYNC_BRANCH
+        self.exe._worktree_ops = SimpleNamespace(add_worktree=lambda *args: str(self.checkout))
+        task = SimpleNamespace(id='sync-branch', takes='repo', build_instruction=lambda _: 'must not build')
+        with patch.object(sync_branch, 'prepare_plan', side_effect=ValueError('branch unavailable'), create=True), \
+                patch.object(self.exe, '_run_agent') as run:
+            self.exe._execute_drafts(self.job, task)
+        self.assertEqual(self.job.state, JobState.FAILED)
+        self.assertIn('Branch plan preparation failed', self.job.error)
+        run.assert_not_called()
+
     def test_standalone_cleanup_refuses_an_unrelated_directory(self):
         self.job.kind = JobKind.NEW_PROJECT
         self.job.notes.update(worktree_path=str(self.checkout), scratch_kind='standalone')
