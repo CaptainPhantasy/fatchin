@@ -64,8 +64,10 @@ exercise them.
 ## Requirements
 
 - Linux with `git`, `gh` (authenticated), and `bubblewrap` (`bwrap`).
-- Python 3.11 or newer.
+- Python 3.11 through 3.15 (all five are CI-tested).
 - An OpenAI-compatible chat endpoint with tool calling, and a key.
+- No Node.js, npm, or build step. The optional browser test runners use a
+  current Node; the worker and the Python suite never invoke it.
 - Optional: a systemd user session for the two supplied units.
 
 ## Quick start

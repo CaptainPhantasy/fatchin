@@ -34,6 +34,16 @@ vulnerability. Include the affected version, a reproduction, and the impact.
   file permissions appropriate for your host.
 - Only GitHub is supported.
 
+## Dependencies
+
+FatChin has **no third-party runtime dependencies**: no pip packages, no npm
+packages, no Node.js runtime, and no build step. The build backend is pinned
+exactly (`setuptools==84.2.1`); GitHub Actions are pinned by commit SHA and
+updated by Dependabot; vulnerability alerts and automated security fixes are
+enabled. The optional browser runners use the machine's current Node and are
+not part of the worker or the Python suite. See
+[DEPENDENCIES.md](docs/DEPENDENCIES.md) for the policy.
+
 ## Supported versions
 
 Security fixes are applied to `main`. There are no maintained release branches
