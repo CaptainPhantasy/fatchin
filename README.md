@@ -89,8 +89,28 @@ fatchin-web --host 127.0.0.1 --port 18465 \
 
 Open <http://127.0.0.1:18465>.
 
-To listen beyond loopback, supply an admin token. The server refuses to bind
-remotely without one:
+### Your first dispatch is a dry run
+
+The fleet form opens with **Dry run** already ticked. Leave it ticked for the
+first pass.
+
+1. Open **Agent fleet**.
+2. Choose your member account and a results folder.
+3. Pick one small repository and dispatch.
+4. Read `dry_run_actions` in the item result and in the report folder: the
+   exact comments, pull requests, and pushes it would have sent.
+5. Stop the fleet. Dispatch again without **Dry run** only when the record
+   matches what you would have approved.
+
+A terminal runner does the same:
+
+```sh
+bash scripts/demo-dry-run.sh owner/repository
+```
+
+### Expose it beyond loopback
+
+Supply an admin token. The server refuses to bind remotely without one:
 
 ```sh
 fatchin-web --host 0.0.0.0 --port 18465 --token "$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
@@ -98,21 +118,6 @@ fatchin-web --host 0.0.0.0 --port 18465 --token "$(python3 -c 'import secrets;pr
 
 The browser asks for that token once and stores it in session storage. `/api/*`
 requires `Authorization: Bearer <token>`.
-
-### First run: dry run
-
-1. Open **Agent fleet**.
-2. Choose your member account and a results folder.
-3. Tick **Dry run**, pick one small repository, and dispatch.
-4. Read `dry_run_actions` in the item result and in the report folder.
-5. Stop the fleet. Dispatch again without **Dry run** when the record matches
-   what you would have approved.
-
-A terminal runner does the same:
-
-```sh
-bash scripts/demo-dry-run.sh owner/repository
-```
 
 ## Configuration
 
