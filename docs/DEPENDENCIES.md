@@ -20,6 +20,7 @@ actually trusted and how it is kept current.
 | `gh` CLI | system package | Documented minimum; authenticated by the operator |
 | bubblewrap | system package | Required for isolated checks; missing or unusable means commands are refused |
 | GitHub Actions | `checkout` v7.0.1, `setup-python` v7.1.0 | Pinned by full commit SHA with a version comment; Dependabot proposes updates |
+| Runner image | Ubuntu 24.04 pinned; Ubuntu 26.04 canary on Python 3.15 | The canary proves the next image before `ubuntu-latest` migrates |
 | Browser assets | Inter font, local SVG icons | Served from `web/`; no network request at runtime |
 | Node.js | none at runtime | The worker and Python suite never invoke Node. The optional Chrome/CDP runners use the machine's current Node and are not installed by this project. |
 
