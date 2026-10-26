@@ -1,5 +1,7 @@
 # FatChin
 
+![FatChin: self-hosted GitHub review fleet with a human merge gate](docs/screenshots/social-preview.png)
+
 **A self-hosted GitHub review fleet with a human merge gate.**
 
 A push goes in. A reviewed, checked, corrected pull request comes out — with a
@@ -29,6 +31,18 @@ agents are useful until one writes to `main`. FatChin takes the middle path:
   and a correction is reviewed by a different worker slot.
 - **A dry run that writes nothing.** Every intended comment, pull request,
   push, and resolution is recorded first.
+
+## Demo
+
+[![FatChin dry run: real Git, simulated GitHub, no writes](docs/screenshots/demo.gif)](docs/screenshots/demo.mp4)
+
+The recording runs the real worker against a real Git checkout with a
+**simulated GitHub**. It finds one defect, records the exact comment it would
+send, and sends nothing. Click the animation for the MP4.
+
+![Dry-run terminal output: one finding, a recorded comment, zero GitHub writes](docs/screenshots/demo-terminal.png)
+
+![The offline suite: 912 tests, OK in 36 seconds](docs/screenshots/tests.png)
 
 ## Safety model
 

@@ -527,6 +527,14 @@ try {
   await waitFor(
     `document.querySelector('h1')?.textContent==='Your work, moving forward.'`,
   );
+  await screenshot("01-overview");
+  await evaluate(`location.hash='fleet'`);
+  await waitFor(`document.querySelector('#fleet-start-form')`);
+  await screenshot("02-fleet-dry-run");
+  await evaluate(`location.hash='overview'`);
+  await waitFor(
+    `document.querySelector('h1')?.textContent==='Your work, moving forward.'`,
+  );
   assert(
     await evaluate(
       `document.querySelector('.empty-state h3')?.textContent==='A fresh start'`,
@@ -684,6 +692,7 @@ try {
   );
   await evaluate(`location.hash='settings'`);
   await delay(100);
+  await screenshot("03-settings");
   await fill("#command-user-lookup", "fixture-user");
   await click("#command-user-add");
   await waitFor(
