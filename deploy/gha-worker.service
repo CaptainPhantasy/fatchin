@@ -1,0 +1,18 @@
+# FatChin worker — systemd USER unit (runs as you, not as root).
+# Install with deploy/install.sh, then start deliberately:
+#   systemctl --user start gha-worker
+[Unit]
+Description=FatChin worker (poll configured repositories and run one job at a time)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+EnvironmentFile=-%h/.config/gha-worker/env
+ExecStart=/usr/bin/env fatchin run
+UMask=0002
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

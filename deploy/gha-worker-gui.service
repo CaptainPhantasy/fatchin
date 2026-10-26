@@ -1,0 +1,24 @@
+# FatChin web interface — systemd USER unit.
+#
+# This unit binds to loopback only. To expose it on a private network, change
+# --host and put a long random value in gui.env:
+#   FATCHIN_ADMIN_TOKEN=...
+# The server refuses to start beyond loopback without that token.
+[Unit]
+Description=FatChin web interface
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h
+EnvironmentFile=-%h/.config/gha-worker/env
+EnvironmentFile=-%h/.config/gha-worker/gui.env
+ExecStart=/usr/bin/env fatchin-web --host 127.0.0.1 --port 18465 \
+  --config %h/.config/gha-worker/config.toml \
+  --env-file %h/.config/gha-worker/env
+UMask=0002
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

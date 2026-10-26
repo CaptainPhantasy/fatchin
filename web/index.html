@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f8f9fc" />
+    <meta
+      name="description"
+      content="Dispatch a fleet across GitHub projects, follow reviews and fixes, and learn Git one step at a time."
+    />
+    <title>FatChin · GitHub automation</title>
+    <meta name="application-name" content="FatChin" />
+    <link
+      rel="icon"
+      type="image/png"
+      sizes="1254x1254"
+      href="/static/brand/fatchin-logo.png"
+    />
+    <link rel="apple-touch-icon" href="/static/brand/fatchin-logo.png" />
+    <link rel="manifest" href="/static/manifest.webmanifest" />
+    <link
+      rel="preload"
+      href="/static/fonts/Inter-Regular.ttf"
+      as="font"
+      type="font/ttf"
+      crossorigin
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script src="/static/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <div id="app" class="app-shell">
+      <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+        <a class="brand" href="#overview" aria-label="FatChin overview">
+          <img
+            class="brand-mark"
+            src="/static/brand/fatchin-logo.png"
+            alt=""
+            width="1254"
+            height="1254"
+            decoding="async"
+          />
+          <small>GitHub automation</small>
+        </a>
+        <p class="nav-label">WORKSPACE</p>
+        <nav id="navigation"></nav>
+        <div class="sidebar-bottom">
+          <div id="sidebar-service" class="sidebar-status">
+            <span class="status-dot muted"></span>Connecting
+          </div>
+          <p>Your fleet. Every repository.</p>
+          <a
+            href="https://github.com/CaptainPhantasy/fatchin"
+            target="_blank"
+            rel="noopener noreferrer"
+            >Project on GitHub
+            <svg class="icon" aria-hidden="true">
+              <use href="/static/icons.svg#external" /></svg></a
+          ><span id="app-version" class="version"></span>
+        </div>
+      </aside>
+      <div id="nav-scrim" class="nav-scrim" hidden></div>
+      <div class="workspace">
+        <header class="topbar">
+          <div class="topbar-leading">
+            <button
+              class="icon-button mobile-menu"
+              id="mobile-menu"
+              aria-label="Open navigation"
+              aria-controls="sidebar"
+              aria-expanded="false"
+            >
+              <svg class="icon" aria-hidden="true">
+                <use href="/static/icons.svg#menu" />
+              </svg></button
+            ><span id="breadcrumb">FatChin <span>/</span> Overview</span>
+          </div>
+          <div class="topbar-actions">
+            <span class="live-label" id="live-label"
+              ><span class="status-dot muted"></span>Connecting</span
+            ><button
+              class="button button-quiet"
+              id="refresh-button"
+              title="Refresh data"
+            >
+              <svg class="icon" aria-hidden="true">
+                <use href="/static/icons.svg#refresh" /></svg
+              ><span>Refresh</span></button
+            ><button class="button button-primary" data-action="new-task">
+              <svg class="icon" aria-hidden="true">
+                <use href="/static/icons.svg#plus" /></svg
+              >New task
+            </button>
+          </div>
+        </header>
+        <main id="main" tabindex="-1">
+          <div class="initial-loader" role="status">
+            <span class="spinner"></span>
+            <h1>Connecting to your worker</h1>
+            <p>Loading repositories, tasks, and settings.</p>
+          </div>
+        </main>
+        <footer class="app-footer">
+          <span>Built for work that moves forward.</span
+          ><span id="last-updated">Waiting for worker</span>
+        </footer>
+      </div>
+    </div>
+    <div
+      id="toast-region"
+      class="toast-region"
+      aria-live="polite"
+      aria-atomic="false"
+    ></div>
+    <dialog id="app-dialog" aria-labelledby="dialog-title">
+      <div class="dialog-header">
+        <div>
+          <p class="eyebrow" id="dialog-eyebrow"></p>
+          <h2 id="dialog-title"></h2>
+        </div>
+        <button class="icon-button" id="dialog-close" aria-label="Close dialog">
+          <svg class="icon" aria-hidden="true">
+            <use href="/static/icons.svg#x" />
+          </svg>
+        </button>
+      </div>
+      <div id="dialog-body"></div>
+      <div id="dialog-footer" class="dialog-footer"></div>
+    </dialog>
+    <dialog id="folder-dialog" aria-labelledby="folder-title">
+      <div class="dialog-header">
+        <div>
+          <p class="eyebrow">YOUR FILES</p>
+          <h2 id="folder-title">Choose a destination folder</h2>
+        </div>
+        <button
+          class="icon-button"
+          id="folder-close"
+          aria-label="Close folder browser"
+        >
+          <svg class="icon" aria-hidden="true">
+            <use href="/static/icons.svg#x" />
+          </svg>
+        </button>
+      </div>
+      <div id="folder-body"></div>
+      <div id="folder-footer" class="dialog-footer"></div>
+    </dialog>
+    <noscript
+      ><div class="noscript-message">
+        This workspace needs JavaScript to display worker status and submit
+        tasks. Enable JavaScript, then reload this page. The command line
+        interface remains available.
+      </div></noscript
+    >
+  </body>
+</html>

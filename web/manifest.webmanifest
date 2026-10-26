@@ -1,0 +1,19 @@
+{
+  "id": "/",
+  "name": "FatChin",
+  "short_name": "FatChin",
+  "description": "Your private workspace for GitHub coding tasks and pull request reviews.",
+  "start_url": "/#overview",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f8f9fc",
+  "theme_color": "#f8f9fc",
+  "icons": [
+    {
+      "src": "/static/brand/fatchin-logo.png",
+      "sizes": "1254x1254",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}
