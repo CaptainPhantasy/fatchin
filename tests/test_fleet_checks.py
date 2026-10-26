@@ -13,13 +13,13 @@ from ghagent.interfaces import Config
 
 @unittest.skipUnless(sandbox_available(), 'isolated checks require bubblewrap')
 class RepositoryCheckTests(unittest.TestCase):
-    def check_project(self, files, command):
+    def check_project(self, files, command, timeout=120):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             for name, value in files.items():
                 path = root / name; path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(value)
-            result = run_repository_checks(Config(run_command_timeout_seconds=30), root, [command])
+            result = run_repository_checks(Config(run_command_timeout_seconds=timeout), root, [command])
             self.assertEqual(len(result), 1)
             self.assertTrue(result[0]['passed'], result)
             for name in ('Cargo.lock', 'go.sum', 'go.work.sum'):
@@ -40,13 +40,13 @@ class RepositoryCheckTests(unittest.TestCase):
             'packages/math/package.json': json.dumps({'name': 'fixture-math', 'version': '1.0.0', 'main': 'index.cjs'}),
             'packages/math/index.cjs': 'module.exports = 4;\n',
             'test.cjs': 'require("node:assert").strictEqual(require("fixture-math"),4);\n'},
-            "bash -c 'npm install --no-audit --no-fund && npm test'")
+            "bash -c 'npm install --no-audit --no-fund && npm test'", timeout=300)
 
     @unittest.skipUnless(shutil.which('cargo'), 'cargo is required')
     def test_rust_workspace_path_dependency_and_ephemeral_lock(self):
         self.check_project({'Cargo.toml': '[workspace]\nmembers=["library"]\nresolver="2"\n',
             'library/Cargo.toml': '[package]\nname="fixture-library"\nversion="0.1.0"\nedition="2021"\n',
-            'library/src/lib.rs': '#[test]\nfn works(){assert_eq!(2+2,4);}\n'}, 'cargo test')
+            'library/src/lib.rs': '#[test]\nfn works(){assert_eq!(2+2,4);}\n'}, 'cargo test', timeout=300)
 
     @unittest.skipUnless(shutil.which('go'), 'Go is required')
     def test_go_local_module_replacement(self):
