@@ -899,6 +899,21 @@ main {
   width: 100%;
   margin: 0 auto;
 }
+.footer-links {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.footer-links a {
+  color: inherit;
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+}
+.footer-links a:hover,
+.footer-links a:focus-visible {
+  color: var(--muted);
+  border-bottom-color: var(--line);
+}
 .empty-state {
   padding: 44px 24px;
   text-align: center;

@@ -213,3 +213,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -t .
 ## License
 
 AGPL-3.0-or-later. See [LICENSE](LICENSE).
+
+---
+
+A [Floyd's Labs](https://www.floydslabs.com/) / [Legacy AI](https://www.legacyai.space/) project.
