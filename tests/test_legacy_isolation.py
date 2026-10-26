@@ -6,6 +6,8 @@ from pathlib import Path
 import shutil
 import tempfile
 import unittest
+
+from tests import sandbox_available
 from unittest.mock import patch
 
 from ghagent.coding_agent import CodingAgent, scrub_env
@@ -24,7 +26,7 @@ class LegacyIsolationTests(unittest.TestCase):
         self.agent = CodingAgent(None, Config(run_command_timeout_seconds=3))
         self.agent._active_worktree = str(self.checkout)
 
-    @unittest.skipUnless(shutil.which('bwrap'), 'bubblewrap is required')
+    @unittest.skipUnless(sandbox_available(), 'bubblewrap is required')
     def test_command_has_no_host_files_credentials_network_or_writable_git(self):
         outside = self.root / 'private-secret'
         outside.write_text('private fixture')
@@ -80,7 +82,7 @@ print(json.dumps({'outside':pathlib.Path(%r).exists(),'home':os.environ.get('HOM
         self.assertEqual(prepare.call_args.args[2], ['python3 -m unittest'])
         self.assertIs(execute.call_args.kwargs['network'], False)
 
-    @unittest.skipUnless(shutil.which('bwrap'), 'bubblewrap is required')
+    @unittest.skipUnless(sandbox_available(), 'bubblewrap is required')
     def test_running_source_is_terminated_when_stop_arrives(self):
         import time
         began = time.monotonic()
@@ -143,7 +145,7 @@ class LegacyPollingTests(unittest.TestCase):
         self.assertEqual((job.command_comment_id, job.requested_by), (9, 7))
 
 
-@unittest.skipUnless(shutil.which('bwrap'), 'bubblewrap is required')
+@unittest.skipUnless(sandbox_available(), 'bubblewrap is required')
 class LinkedWorktreeIsolationTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

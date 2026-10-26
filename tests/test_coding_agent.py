@@ -11,6 +11,8 @@ import subprocess
 import tempfile
 import unittest
 
+from tests import sandbox_available
+
 from ghagent.coding_agent import CodingAgent
 from ghagent.interfaces import Config
 from ghagent.model_client import ModelError, SpendLimitExceeded
@@ -53,6 +55,7 @@ def resp(*calls, content=None):
     }
 
 
+@unittest.skipUnless(sandbox_available(), 'bubblewrap must be installed and usable')
 class CodingAgentTest(unittest.TestCase):
     def setUp(self):
         base = tempfile.mkdtemp(prefix="ghagent-coding-")

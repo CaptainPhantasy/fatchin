@@ -5,11 +5,13 @@ import shutil
 import tempfile
 import unittest
 
+from tests import sandbox_available
+
 from ghagent.fleet_checks import _copy_manifests, run_repository_checks
 from ghagent.interfaces import Config
 
 
-@unittest.skipUnless(shutil.which('bwrap'), 'isolated checks require bubblewrap')
+@unittest.skipUnless(sandbox_available(), 'isolated checks require bubblewrap')
 class RepositoryCheckTests(unittest.TestCase):
     def check_project(self, files, command):
         with tempfile.TemporaryDirectory() as tmp:

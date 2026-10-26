@@ -1,6 +1,8 @@
 """Real write guards through the manual approval controller, local remotes only."""
 import json
 import unittest
+
+from tests import sandbox_available
 from unittest.mock import patch
 from ghagent import tasks
 from ghagent.interfaces import JobKind, JobState
@@ -11,6 +13,7 @@ from tests import test_task_write_guard as guard_fixture
 from tests.test_web_control import GuiFixture
 
 
+@unittest.skipUnless(sandbox_available(), 'bubblewrap must be installed and usable')
 class IntegratedDraftGuards(GuiFixture, unittest.TestCase):
     def setUp(self):
         self.build_gui()

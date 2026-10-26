@@ -20,6 +20,8 @@ import tempfile
 import threading
 import time
 import unittest
+
+from tests import sandbox_available
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -110,6 +112,7 @@ fail("Unexpected fixture gh command: " + " ".join(args[:2]))
 '''
 
 
+@unittest.skipUnless(sandbox_available(), 'bubblewrap must be installed and usable')
 class CliSubprocessAcceptance(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="gha-cli-e2e-")

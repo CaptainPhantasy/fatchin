@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+
+from tests import sandbox_available
 from unittest.mock import patch
 
 from ghagent.fleet_checks import auto_repository_policy, discover_checks, run_repository_checks
@@ -69,7 +71,7 @@ class FleetIntegrationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Set verification command'):
                 auto_repository_policy(Config(), None, 'owner/project', 'main', work)
 
-    @unittest.skipUnless(shutil.which('bwrap'), 'bubblewrap is required for isolated repository checks')
+    @unittest.skipUnless(sandbox_available(), 'bubblewrap is required for isolated repository checks')
     def test_actual_repository_test_runs_without_host_credentials_or_account_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / 'checkout'; root.mkdir()
@@ -95,7 +97,7 @@ class FleetIntegrationTests(unittest.TestCase):
             self.assertIn('Ran 1 test', result[0]['output_tail'])
             self.assertNotIn('example-parent-only', json.dumps(result))
 
-    @unittest.skipUnless(shutil.which('bwrap'), 'bubblewrap is required for isolated repository checks')
+    @unittest.skipUnless(sandbox_available(), 'bubblewrap is required for isolated repository checks')
     def test_failing_checks_are_real_and_no_unconfined_fallback_is_used(self):
         with tempfile.TemporaryDirectory() as root:
             result = run_repository_checks(Config(run_command_timeout_seconds=10), root,

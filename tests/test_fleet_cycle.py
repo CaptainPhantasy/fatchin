@@ -8,6 +8,8 @@ from __future__ import annotations
 import copy
 import shutil
 import unittest
+
+from tests import sandbox_available
 from urllib.parse import unquote, urlsplit
 
 from ghagent import fleet_runner as fr
@@ -103,7 +105,7 @@ class CycleGitHub(GitHub):
         return super().graphql(query, variables)
 
 
-@unittest.skipUnless(shutil.which('bwrap'), 'This integration exercises the actual isolated Linux check runner')
+@unittest.skipUnless(sandbox_available(), 'This integration exercises the actual isolated Linux check runner')
 class FleetCycleTests(unittest.TestCase):
     checks = fixtures.FleetRunnerTests.checks
     process = fixtures.FleetRunnerTests.process

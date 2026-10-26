@@ -9,6 +9,8 @@ import subprocess
 import shutil
 import tempfile
 import unittest
+
+from tests import sandbox_available
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -604,7 +606,7 @@ class FleetRunnerTests(unittest.TestCase):
         self.assertFalse(model.messages)
         self.assertEqual(len(self.gh.writes), 1)
 
-    @unittest.skipUnless(shutil.which('bwrap'), 'Isolated Linux verification uses bubblewrap')
+    @unittest.skipUnless(sandbox_available(), 'Isolated Linux verification uses bubblewrap')
     def test_real_isolated_check_helper_runs_the_final_candidate(self):
         from ghagent.fleet_checks import run_repository_checks
         with patch.object(fr, '_run_repository_checks', run_repository_checks):

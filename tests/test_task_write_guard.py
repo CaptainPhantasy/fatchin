@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+
+from tests import sandbox_available
 import os
 import shlex
 import subprocess
@@ -46,6 +48,7 @@ class InspectionGh:
         raise ValueError('404 Not Found')
 
 
+@unittest.skipUnless(sandbox_available(), 'bubblewrap must be installed and usable')
 class RealRepositoryTests(unittest.TestCase):
     """Checks read real candidate files; every remote is a temporary local bare repo."""
     def setUp(self):
