@@ -1,5 +1,7 @@
 # Demo assets
 
+- `architecture.png` — module diagram supplied by the project owner, generated
+  with GitDiagram. It shows the public module names and the write path.
 - `social-preview.png` — 1280×640 card built from `web/brand/fatchin-logo.png`.
   Upload it in **Settings → General → Social preview** (GitHub has no REST
   endpoint for this image).

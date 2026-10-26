@@ -168,6 +168,16 @@ configuration.
 The fleet adds an independent reviewer: a correction is reviewed by a different
 slot, and work that passes appears in **Ready to merge**.
 
+## Architecture
+
+<a href="docs/screenshots/architecture.png"><img src="docs/screenshots/architecture.png" alt="Module diagram: operator interfaces, fleet orchestration, task execution, state and safeguards, GitHub and the model endpoint" width="900"></a>
+
+The diagram maps the modules in `src/ghagent/`. Operator interfaces call the
+web control plane; the fleet discovers work and supervises workers; each job
+runs through the executor in an isolated checkout. Write admission and result
+storage sit between the worker and GitHub, so the model never holds the token
+and no module contains a merge call.
+
 ## Limitations
 
 - GitHub only.
