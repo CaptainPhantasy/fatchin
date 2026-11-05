@@ -103,9 +103,14 @@ class FleetStore:
             # Active and held work stays visible ahead of queued background files.
             items.sort(key=lambda i: i.get('updated_at') or i.get('created_at', ''), reverse=True)
             items.sort(key=lambda i: {'running': 0, 'blocked': 1, 'retrying': 2, 'done': 3}.get(i['status'], 4))
-            public = [{k: copy.deepcopy(i[k]) for k in ('id', 'repo', 'kind', 'number', 'title',
-                'url', 'status', 'stage', 'provider', 'slot', 'error', 'updated_at') if k in i}
-                for i in items[:60]]
+            open_comments = self._open_fix_comments(data['items'].values())
+            public = []
+            for item in items[:60]:
+                row = {k: copy.deepcopy(item[k]) for k in ('id', 'repo', 'kind', 'number', 'title',
+                    'url', 'status', 'stage', 'provider', 'slot', 'error', 'updated_at') if k in item}
+                # Same gate as snapshot()['ready']. finish() stores a ready review as done.
+                row['merge_ready'] = self._merge_ready(item, open_comments)
+                public.append(row)
             return {'fleets': [{k: copy.deepcopy(f[k]) for k in ('id', 'account', 'status', 'scope',
                         'workers', 'deepseek_workers', 'output_dir', 'last_scan_at', 'error') if k in f}
                     for f in fleets],
@@ -754,6 +759,20 @@ class FleetStore:
         with self._locked(True) as data:
             data['supervisor'].update(copy.deepcopy(fields), heartbeat_at=now())
 
+    @staticmethod
+    def _open_fix_comments(items):
+        return [i for i in items if i.get('kind') == 'fix_comment' and not i.get('resolved_at') and i.get('status') != 'dismissed']
+
+    @staticmethod
+    def _merge_ready(item, open_comments):
+        """Authoritative human merge gate. A finished review is not enough."""
+        readiness = item.get('readiness') or {}
+        return (item.get('kind') == 'review_pr' and item.get('status') == 'done'
+                and bool(readiness.get('ready'))
+                and readiness.get('head_sha') == item.get('head_sha')
+                and not any(c.get('repo') == item.get('repo') and c.get('number') == item.get('number')
+                            for c in open_comments))
+
     def snapshot(self):
         data = self.internal()
         items = []
@@ -761,13 +780,8 @@ class FleetStore:
             public = {k: v for k, v in item.items() if k not in {'lease', 'process', 'fenced', 'mutation_intents'}}
             public['operations'] = [{'id': op['id'], 'kind': op['kind'], 'state': op['state']} for op in item.get('mutation_intents', [])]
             items.append(public)
-        open_comments = [i for i in items if i['kind'] == 'fix_comment' and not i.get('resolved_at') and i['status'] != 'dismissed']
-        ready = []
-        for item in items:
-            if (item['kind'] == 'review_pr' and item['status'] == 'done' and item.get('readiness', {}).get('ready')
-                    and item['readiness'].get('head_sha') == item.get('head_sha')
-                    and not any(c['repo'] == item['repo'] and c.get('number') == item['number'] for c in open_comments)):
-                ready.append(item)
+        open_comments = self._open_fix_comments(items)
+        ready = [item for item in items if self._merge_ready(item, open_comments)]
         return {'version': 1, 'max_workers': MAX_WORKERS, 'max_workers_per_provider': MAX_PER_PROVIDER, 'fleets': list(data['fleets'].values()),
                 'workers': list(data['workers'].values()), 'items': items, 'ready': ready,
                 'comments': open_comments, 'rate_limits': data.get('rate_limits', {}), 'events': data['events'], 'supervisor': data['supervisor']}
