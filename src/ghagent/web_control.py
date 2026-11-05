@@ -989,12 +989,21 @@ class WebControl:
         wt = job.notes.get('worktree_path')
         if not wt:
             return
+        if job.notes.get('output_dir'):
+            try:
+                from .results import export_worktree
+                export_worktree(job, wt)
+                job.notes.pop('result_export_error', None)
+            except Exception as exc:
+                job.notes['result_export_error'] = str(exc)[:300]
+                job.notes['worktree_cleanup'] = 'Scratch retained because result export failed. Correct the destination access before recovery.'
+                return
         try:
             from .wiring import WorktreeOpsAdapter
-            ops = WorktreeOpsAdapter(self.config())
-            ops.remove_worktree(wt)
-            ops.prune()
-            job.notes.pop('worktree_path', None)
+            from .executor import cleanup_owned_checkout
+            cfg = self.config()
+            ops = WorktreeOpsAdapter(cfg)
+            cleanup_owned_checkout(ops, cfg, job, wt)
         except Exception:
             job.notes['worktree_cleanup'] = 'Scratch retained; remove it by hand once the task is finished.'
 

@@ -295,7 +295,8 @@ class TaskLifecycleTests(unittest.TestCase):
         executor, _ = self.executor(transport)
         with patch.object(sync_branch, 'apply') as apply:
             with patch('ghagent.executor.tasks.get',
-                       return_value=replace(sync_branch.TASK, apply=apply)):
+                       return_value=replace(sync_branch.TASK, apply=apply)), \
+                    patch.object(sync_branch, 'prepare_plan'):
                 returned = executor.execute(job)
         self.assertEqual(returned.state, JobState.WAITING_ON_YOU, returned.error)
         self.assertNotIn('posted', returned.notes)

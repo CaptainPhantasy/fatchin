@@ -532,6 +532,7 @@ class FleetStore:
                 for repo in self._repositories(running):
                     repository_load[repo] = repository_load.get(repo, 0) + 1
             candidates = []
+            changed = False
             for item in data['items'].values():
                 fleet = data['fleets'][item['fleet_id']]
                 if fleet.get('max_calls_total') and int(fleet.get('calls_used') or 0) >= int(fleet['max_calls_total']):
@@ -539,6 +540,7 @@ class FleetStore:
                         fleet['status'] = 'paused'
                         fleet['error'] = 'The run budget is exhausted. Resume the fleet to continue.'
                         self._event(data, 'Run budget reached; no new work was assigned.')
+                        changed = True
                     continue
                 if (item['status'] not in PENDING or fleet['status'] != 'running'
                         or not self._in_scope(fleet, item)
@@ -555,6 +557,8 @@ class FleetStore:
             candidates.sort(key=lambda i: (i.get('created_at', ''), i['id']), reverse=True)
             candidates.sort(key=lambda i: i['priority'])
             if not candidates:
+                if changed:
+                    atomic_json(self.path, data)
                 return None
             item = candidates[0]
             item.update(status='running', provider=provider, lease=secrets.token_hex(24), fenced=False, slot=slot,

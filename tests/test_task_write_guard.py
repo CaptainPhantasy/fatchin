@@ -100,8 +100,13 @@ class RealRepositoryTests(unittest.TestCase):
         return shlex.join([sys.executable, '-c', code])
 
     def job(self, module, accept=False, **notes):
-        return Job('job_guard', JobKind(module.TASK.id), 'owner/repo', 0, 0, 1,
-                   notes={'request': {'accept_no_checks': accept}, **notes})
+        job = Job('job_guard', JobKind(module.TASK.id), 'owner/repo', 0, 0, 1,
+                  notes={'request': {'accept_no_checks': accept}, **notes})
+        if module is sync_branch:
+            job.notes['planned_refs'] = {
+                f'refs/heads/{branch}': self.git('rev-parse', f'origin/{branch}')
+                for branch in ('develop', 'main')}
+        return job
 
     def context(self, **over):
         result = {'repo': 'owner/repo', 'config': self.cfg,
@@ -215,7 +220,7 @@ class RealRepositoryTests(unittest.TestCase):
         self.git('commit', '-m', 'later source work', cwd=self.seed)
         self.git('push', 'origin', 'develop', cwd=self.seed)
         before = self.branches()
-        with self.assertRaisesRegex(PreWriteRefusal, 'source branch moved'):
+        with self.assertRaisesRegex(PreWriteRefusal, 'source or target branch moved'):
             sync_branch.apply(self.context(), self.gh, self.job(sync_branch, accept=True))
         self.assertEqual(self.branches(), before)
 
@@ -418,7 +423,9 @@ class GuardRegressionTests(unittest.TestCase):
                                  (write_docs, JobKind.WRITE_DOCS)):
                 with self.subTest(task=kind.value):
                     job = Job('job_guard', kind, 'owner/repo', 0, 0, 1,
-                              notes={'request': {'accept_no_checks': True}})
+                              notes={'request': {'accept_no_checks': True},
+                                     'planned_refs': {f'refs/heads/{branch}': 'a' * 40
+                                                      for branch in ('develop', 'main')}})
                     calls = []
                     def git(args, cwd, **kwargs):
                         calls.append(list(args))

@@ -377,7 +377,8 @@ def run_job(job, gh, cfg=None, wt=None, agent=None):
             raise ValueError(note)
         produced = wt.commit_all(path, 'fixture candidate')
         tested = wt.current_sha(path)
-        job.notes.update(candidate_commit=produced, tested_commit=tested,
+        job.notes.update(candidate_commit=produced, tested_base=tested,
+                         tested_commit=tested,
                          changed_files=list(agent.result.changed_files),
                          checks=list(agent.result.checks))
         return checks_pass, note, tested

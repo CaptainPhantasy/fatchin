@@ -1,9 +1,8 @@
 """Job execution flow: RETRIEVING → WORKING → VERIFYING → RESPONDING → DONE/FAILED.
 
-Sibling worker modules (ghagent.github_client, ghagent.queue,
-ghagent.coding_agent, ghagent.worktree) are INJECTED, never imported at
-module level. ghagent.worktree is imported lazily at call time when no
-worktree_ops is supplied. See interfaces.py for the shared contracts.
+Worker collaborators can be injected. Without injected worktree operations,
+the executor lazily creates the installed wiring adapter. See interfaces.py
+for the shared contracts.
 
 Worktree-ops duck type expected by this module (all positional):
 
@@ -496,8 +495,9 @@ class JobExecutor:
     def _ops(self):
         if self._worktree_ops is not None:
             return self._worktree_ops
-        from . import worktree  # lazy: sibling module, built in parallel
-        return worktree
+        from .wiring import WorktreeOpsAdapter
+        self._worktree_ops = WorktreeOpsAdapter(self.cfg)
+        return self._worktree_ops
 
     def _repo_cfg(self, job: Job):
         for rc in getattr(self.cfg, "repos", None) or []:
@@ -1040,6 +1040,8 @@ class JobExecutor:
 
         message = f"gha-worker {job.kind.value} #{job.number} ({job.job_id})"
         self._ops().commit_all(wt, message)
+        if self._stopped(job.job_id):
+            raise ValueError('Task stopped before verification completed')
         tested = commit_id(_run_git, wt, 'HEAD')
         tree = commit_id(_run_git, wt, 'HEAD^{tree}')
         ensure_prepared_tree(_run_git, wt, tree)

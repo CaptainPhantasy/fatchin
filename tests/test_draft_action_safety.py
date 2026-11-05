@@ -58,6 +58,36 @@ class DraftActionSafetyTests(GuiFixture, unittest.TestCase):
         self.update_notes(drafts=self.stored().notes['drafts'] + [
             {'name': 'two', 'title': 'Second issue', 'body': 'Second words.'}])
 
+    def test_discard_cleans_only_owned_standalone_scratch_after_export(self):
+        job = self.stored()
+        job.kind = JobKind.NEW_PROJECT
+        job.head_sha = ''
+        job.started_commit = ''
+        scratch = self.worktrees / 'new-project-job_test'
+        scratch.mkdir(parents=True)
+        subprocess.run(['git', 'init', '-q', str(scratch)], check=True)
+        (scratch / 'README.md').write_text('Retained result\n')
+        job.notes.update(worktree_path=str(scratch), scratch_kind='standalone',
+                         member_home=str(self.home))
+        self.control.queue().update(job)
+        self.action('discard')
+        self.assertFalse(scratch.exists())
+        self.assertNotIn('worktree_path', self.stored().notes)
+        self.assertNotIn('result_export_error', self.stored().notes)
+        self.assertTrue(list(self.output.rglob('README.md')))
+
+    def test_failed_export_preserves_standalone_scratch(self):
+        job = self.stored()
+        job.kind = JobKind.NEW_PROJECT
+        scratch = self.worktrees / 'new-project-job_test'
+        scratch.mkdir(parents=True)
+        (scratch / '.git').mkdir()
+        job.notes.update(worktree_path=str(scratch), scratch_kind='standalone')
+        with patch('ghagent.results.export_worktree', side_effect=ValueError('Output unavailable')):
+            self.control._cleanup_job_worktree(job)
+        self.assertTrue(scratch.exists())
+        self.assertIn('Output unavailable', job.notes['result_export_error'])
+
     def other_control(self):
         return WebControl(self.config_path, self.env_path, gh=self.gh,
                           runner=self.runner, accounts=self.control._accounts)
