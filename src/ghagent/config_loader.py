@@ -75,7 +75,33 @@ def load_config(path: str | Path) -> Config:
             "config is missing required keys: " + ", ".join(missing),
             missing_destination=True,
         )
+    problems = fleet_table_problems(cfg)
+    if problems:
+        raise ConfigError("; ".join(problems))
     return cfg
+
+
+FLEET_PROVIDER_IDS = ("glm", "deepseek")
+FLEET_ITEM_KINDS = ("review_pr", "fix_comment", "review_code", "open_pr")
+
+
+def fleet_table_problems(cfg: Config) -> list[str]:
+    """Validate the optional [fleet_roles] / [fleet_max_calls_per_day] tables."""
+    problems = []
+    for kind, provider in (cfg.fleet_roles or {}).items():
+        if kind not in FLEET_ITEM_KINDS:
+            problems.append(f"fleet_roles: unknown item kind {kind!r} (use {', '.join(FLEET_ITEM_KINDS)})")
+        elif provider not in FLEET_PROVIDER_IDS:
+            problems.append(f"fleet_roles.{kind}: provider must be one of {', '.join(FLEET_PROVIDER_IDS)}")
+    for provider, cap in (cfg.fleet_max_calls_per_day or {}).items():
+        if provider not in FLEET_PROVIDER_IDS:
+            problems.append(f"fleet_max_calls_per_day: unknown provider {provider!r}")
+        elif type(cap) is not int or cap < 1:
+            problems.append(f"fleet_max_calls_per_day.{provider}: must be a positive integer")
+    pace = cfg.model.min_seconds_between_calls
+    if isinstance(pace, bool) or not isinstance(pace, (int, float)) or pace < 0:
+        problems.append("model.min_seconds_between_calls: must be a number >= 0")
+    return problems
 
 
 def load_env_file(path: str | Path) -> dict[str, str]:

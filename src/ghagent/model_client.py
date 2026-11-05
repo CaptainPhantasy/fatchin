@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import contextlib
 import email.utils
+import fcntl
 import http.client
 import json
 import os
@@ -55,6 +56,7 @@ class ModelClient:
         sleep: Callable[[float], None] = time.sleep,
         urlopen: Callable[..., Any] = urllib.request.urlopen,
         max_attempts: int = _MAX_ATTEMPTS,
+        clock: Callable[[], float] = time.time,
     ) -> None:
         if not cfg.base_url:
             raise ValueError("ModelConfig.base_url must not be empty")
@@ -73,6 +75,8 @@ class ModelClient:
         self._max_attempts = max_attempts
         self._calls_used = 0
         self._counter_lock = threading.Lock()
+        self._clock = clock
+        self._last_call_at = 0.0
 
     # -- public API ---------------------------------------------------------
 
@@ -96,6 +100,7 @@ class ModelClient:
         once. Spend ceilings are checked before any request is sent.
         """
         self._reserve_spend()
+        self._pace()
         payload: dict[str, Any] = {
             "model": self._cfg.model_id,
             "messages": messages,
@@ -123,6 +128,39 @@ class ModelClient:
         status = re.search(r'\bHTTP\s+(\d{3})\b', str(last_error))
         error.http_status = int(status[1]) if status else None
         raise error
+
+    # -- pacing --------------------------------------------------------------
+
+    def _pace(self) -> None:
+        """Keep at least min_seconds_between_calls between calls on one ledger.
+
+        With a day counter the gap is shared by every process using that
+        ledger (one per fleet provider) through a locked ``.pace`` file.
+        """
+        gap = float(getattr(self._cfg, "min_seconds_between_calls", 0) or 0)
+        if gap <= 0:
+            return
+        if not self._day_counter_path:
+            with self._counter_lock:
+                wait = self._last_call_at + gap - self._clock()
+                if wait > 0:
+                    self._sleep(min(wait, gap))
+                self._last_call_at = self._clock()
+            return
+        with open(self._day_counter_path + ".pace", "a+", encoding="utf-8") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            fh.seek(0)
+            try:
+                last = float(fh.read().strip() or 0)
+            except ValueError:
+                last = 0.0
+            wait = last + gap - self._clock()
+            if wait > 0:
+                self._sleep(min(wait, gap))
+            fh.seek(0)
+            fh.truncate()
+            fh.write(repr(self._clock()))
+            fh.flush()
 
     # -- spend ceilings ------------------------------------------------------
 

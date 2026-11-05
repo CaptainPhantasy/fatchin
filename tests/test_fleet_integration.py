@@ -23,13 +23,13 @@ from tests.test_web_control import GuiFixture
 
 class FleetIntegrationTests(unittest.TestCase):
     def test_provider_pools_use_exact_models_and_private_runtime_settings(self):
-        cfg = Config(model=ModelConfig(max_calls_per_day=600, max_calls_per_job=100))
+        cfg = Config(model=ModelConfig(model_id='glm-5.3-flash', max_calls_per_day=600, max_calls_per_job=100))
         env = {'MCP_SECRET_BROKER_ADMIN_TOKEN': 'example-broker-value'}
         before = dataclasses.asdict(cfg)
         glm, _ = model_config(cfg, env, 'glm')
         deepseek, copied = model_config(cfg, env, 'deepseek')
-        self.assertEqual(glm.model.model_id, 'your-model')
-        self.assertEqual(deepseek.model.model_id, 'your-second-model')
+        self.assertEqual(glm.model.model_id, 'glm-5.3-flash')
+        self.assertEqual(deepseek.model.model_id, 'deepseek-flash')
         self.assertEqual(deepseek.model.base_url, cfg.model.broker_base_url + '/proxy/deepseek')
         self.assertEqual(deepseek.model.broker_server_id, 'deepseek')
         self.assertEqual(deepseek.model.max_calls_per_job, 100)
@@ -127,7 +127,7 @@ class FleetIntegrationTests(unittest.TestCase):
 class FleetControlTests(GuiFixture, unittest.TestCase):
     def setUp(self):
         self.build_gui()
-        self.config_path.write_text(self.config_path.read_text().replace('model_id = "model-a"', 'model_id = "your-model"'))
+        self.config_path.write_text(self.config_path.read_text().replace('model_id = "model-a"', 'model_id = "glm-5.3-flash"'))
         self.env_path.write_text(self.env_path.read_text() + 'MCP_SECRET_BROKER_ADMIN_TOKEN=example-broker-test\n')
         self.start = {'action': 'start', 'account': 'alice', 'output_dir': str(self.output),
                       'workers': 10, 'deepseek_workers': 10, 'scope': 'all'}

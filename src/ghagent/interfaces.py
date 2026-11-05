@@ -55,6 +55,7 @@ class ModelConfig:
     max_tokens: int = 8192          # your-model is a reasoning model; keep generous
     max_calls_per_job: int = 60     # spend ceiling: model calls per job
     max_calls_per_day: int = 600    # spend ceiling: model calls per calendar day (UTC)
+    min_seconds_between_calls: float = 0.0  # pacing per call ledger; 0 = no pacing
 
 
 @dataclass
@@ -75,6 +76,9 @@ class Config:
     fleet_policy: dict = field(default_factory=dict)  # org opt-in / personal opt-out
     max_fleet_publications_per_repo_per_day: int = 12
     max_fleet_calls_total: int = 0  # 0 = no per-run ceiling
+    # Optional fleet tables. Empty keeps the slot-based defaults.
+    fleet_roles: dict = field(default_factory=dict)              # item kind -> "glm" | "deepseek"
+    fleet_max_calls_per_day: dict = field(default_factory=dict)  # provider -> calls per UTC day
 
     @staticmethod
     def load(path: str | Path) -> "Config":
