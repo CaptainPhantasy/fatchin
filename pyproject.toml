@@ -27,6 +27,9 @@ classifiers = [
 ]
 dependencies = []
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.scripts]
 fatchin = "ghagent.cli:main"
 fatchin-web = "ghagent.web:main"
