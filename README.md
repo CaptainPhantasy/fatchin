@@ -77,7 +77,7 @@ git clone https://github.com/CaptainPhantasy/fatchin.git
 cd fatchin
 python3 -m pip install -e .
 
-fatchin init-config --path ~/.config/gha-worker/config.toml
+fatchin init-config ~/.config/gha-worker/config.toml
 # edit state_dir, worktree_root, [[repos]], and [model]
 
 mkdir -p ~/.config/gha-worker
