@@ -10,6 +10,8 @@ numbers only, never file contents.
 """
 from __future__ import annotations
 
+import math
+
 import re
 import tomllib
 from pathlib import Path
@@ -88,7 +90,9 @@ FLEET_ITEM_KINDS = ("review_pr", "fix_comment", "review_code", "open_pr")
 def fleet_table_problems(cfg: Config) -> list[str]:
     """Validate the optional [fleet_roles] / [fleet_max_calls_per_day] tables."""
     problems = []
-    for kind, provider in (cfg.fleet_roles or {}).items():
+    if not isinstance(cfg.fleet_roles, dict) or not isinstance(cfg.fleet_max_calls_per_day, dict):
+        return ["fleet_roles and fleet_max_calls_per_day must be tables"]
+    for kind, provider in cfg.fleet_roles.items():
         if kind not in FLEET_ITEM_KINDS:
             problems.append(f"fleet_roles: unknown item kind {kind!r} (use {', '.join(FLEET_ITEM_KINDS)})")
         elif provider not in FLEET_PROVIDER_IDS:
@@ -99,8 +103,8 @@ def fleet_table_problems(cfg: Config) -> list[str]:
         elif type(cap) is not int or cap < 1:
             problems.append(f"fleet_max_calls_per_day.{provider}: must be a positive integer")
     pace = cfg.model.min_seconds_between_calls
-    if isinstance(pace, bool) or not isinstance(pace, (int, float)) or pace < 0:
-        problems.append("model.min_seconds_between_calls: must be a number >= 0")
+    if isinstance(pace, bool) or not isinstance(pace, (int, float)) or not math.isfinite(pace) or pace < 0:
+        problems.append("model.min_seconds_between_calls: must be a finite number >= 0")
     return problems
 
 

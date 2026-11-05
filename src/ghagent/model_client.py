@@ -100,7 +100,6 @@ class ModelClient:
         once. Spend ceilings are checked before any request is sent.
         """
         self._reserve_spend()
-        self._pace()
         payload: dict[str, Any] = {
             "model": self._cfg.model_id,
             "messages": messages,
@@ -115,6 +114,7 @@ class ModelClient:
         last_error: Exception | None = None
         for attempt in range(self._max_attempts):
             try:
+                self._pace()
                 return self._send_once(payload)
             except _RetryableError as exc:
                 last_error = exc

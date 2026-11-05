@@ -62,15 +62,18 @@ def toml_document(data):
         if isinstance(item, list):
             return '[' + ', '.join(value(v) for v in item) + ']'
         raise ApiError('An unsupported configuration value was supplied.')
+    tables = {'model', 'fleet_policy', 'fleet_roles', 'fleet_max_calls_per_day'}
     lines = ['# gha-worker configuration. Edited by the graphical interface.']
     for key, item in data.items():
-        if key not in {'repos', 'model'}:
+        if key not in tables | {'repos'}:
             lines.append(f'{key} = {value(item)}')
     for repo in data.get('repos', []):
         lines.append('\n[[repos]]')
         lines.extend(f'{key} = {value(item)}' for key, item in repo.items())
-    lines.append('\n[model]')
-    lines.extend(f'{key} = {value(item)}' for key, item in data.get('model', {}).items())
+    for table in sorted(tables):
+        if table in data:
+            lines.append(f'\n[{table}]')
+            lines.extend(f'{key} = {value(item)}' for key, item in data[table].items())
     return '\n'.join(lines) + '\n'
 
 
@@ -1032,6 +1035,10 @@ class WebControl:
         return {'ok': True, 'restart_required': True}
 
     def validate_settings(self, cfg):
+        from .config_loader import fleet_table_problems
+        problems = fleet_table_problems(cfg)
+        if problems:
+            raise ApiError("; ".join(problems))
         for value in [cfg.poll_repos, cfg.model.disable_reasoning, *[r.allow_unknown_rulesets for r in cfg.repos]]:
             if type(value) is not bool:
                 raise ApiError('Choose Yes or No for each on/off setting.')

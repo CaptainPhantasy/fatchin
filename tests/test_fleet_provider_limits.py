@@ -149,6 +149,24 @@ class PacingTests(unittest.TestCase):
         pace.assert_called_once()
 
 
+class PacingRetryTests(unittest.TestCase):
+    def test_every_attempt_obeys_the_gap(self):
+        from ghagent.model_client import _RetryableError
+        helper = PacingTests()
+        client, sleeps, clock = helper.client(10)
+        attempts = []
+
+        def send(payload):
+            attempts.append(clock['t'])
+            if len(attempts) == 1:
+                raise _RetryableError('HTTP 429')
+            return {'content': 'ok'}
+
+        with patch.object(client, '_send_once', send):
+            self.assertEqual(client.chat([]), {'content': 'ok'})
+        self.assertGreaterEqual(attempts[1] - attempts[0], 10)
+
+
 class HaltLabelTests(unittest.TestCase):
     def test_halted_label_is_detected(self):
         self.assertTrue(_halted({'labels': [{'name': 'bug'}, {'name': 'fatchin-halted'}]}))
@@ -168,6 +186,29 @@ class ConfigTableTests(unittest.TestCase):
         self.assertEqual(cfg.fleet_roles['review_pr'], 'deepseek')
         self.assertEqual(cfg.fleet_max_calls_per_day['glm'], 4000)
         self.assertEqual(cfg.model.min_seconds_between_calls, 1.5)
+
+    def test_gui_serializer_preserves_fleet_tables(self):
+        import tomllib
+        from ghagent.web_control import toml_document
+        raw = {'state_dir': '/tmp/s', 'worktree_root': '/tmp/w', 'repos': [{'owner': 'owner', 'name': 'repo'}],
+               'model': {'model_id': 'glm-5.3-flash', 'min_seconds_between_calls': 1.5},
+               'fleet_roles': {'review_pr': 'deepseek', 'fix_comment': 'glm'},
+               'fleet_max_calls_per_day': {'glm': 4000, 'deepseek': 3000},
+               'fleet_policy': {'personal_default': 'exclude', 'include': ['owner/repo']}}
+        self.assertEqual(tomllib.loads(toml_document(raw)), raw)
+
+    def test_nonfinite_pacing_is_rejected_in_loader_and_gui(self):
+        from ghagent.web_control import ApiError, WebControl
+        for value in (-1, float('inf'), float('-inf'), float('nan')):
+            with self.subTest(value=value):
+                cfg = glm_cfg()
+                cfg.model.min_seconds_between_calls = value
+                self.assertTrue(fleet_table_problems(cfg))
+                with self.assertRaises(ApiError):
+                    WebControl.validate_settings(None, cfg)
+
+    def test_scalar_fleet_table_is_rejected(self):
+        self.assertTrue(fleet_table_problems(glm_cfg(fleet_roles='deepseek')))
 
     def test_invalid_tables_are_rejected(self):
         bad = glm_cfg(fleet_roles={'review_pr': 'gpt', 'merge': 'glm'},
