@@ -6,9 +6,12 @@ from dataclasses import replace
 
 from .config_loader import model_auth_problems
 
+GLM_MODEL_ID = 'glm-5.3-flash'
+DEEPSEEK_MODEL_ID = 'deepseek-flash'  # DeepSeek API id, served by V4.1-Flash-1017
+
 PROVIDERS = (
-    {'id': 'glm', 'label': 'GLM-5.3-flash', 'model_id': 'your-model', 'limit': 10},
-    {'id': 'deepseek', 'label': 'DeepSeek V4.1 Flash 1017', 'model_id': 'your-second-model', 'limit': 10,
+    {'id': 'glm', 'label': 'GLM-5.3-flash', 'model_id': GLM_MODEL_ID, 'limit': 10},
+    {'id': 'deepseek', 'label': 'DeepSeek V4.1 Flash 1017', 'model_id': DEEPSEEK_MODEL_ID, 'limit': 10,
      'context_window': 1_000_000},
 )
 
@@ -16,28 +19,30 @@ PROVIDERS = (
 def model_config(cfg, env, provider):
     """Return a private runtime copy, leaving saved settings and keys intact.
 
-    Fleet work is continuous. Its own ledger counts usage without the legacy
-    daily stop; every individual task retains a bounded call allowance.
+    Fleet work is continuous. Its own per-provider ledger counts usage; the
+    daily stop comes from [fleet_max_calls_per_day] (unset = no daily stop),
+    and every individual task retains a bounded call allowance.
     """
     values = dict(env)
     if provider == 'glm':
-        if cfg.model.model_id != 'your-model':
+        if cfg.model.model_id != GLM_MODEL_ID:
             raise ValueError('The GLM fleet requires GLM-5.3-flash. Restore that model in Settings.')
         model = cfg.model
     elif provider == 'deepseek':
         if values.get('MCP_SECRET_BROKER_ADMIN_TOKEN'):
-            model = replace(cfg.model, model_id='your-second-model', auth_mode='broker-lease',
+            model = replace(cfg.model, model_id=DEEPSEEK_MODEL_ID, auth_mode='broker-lease',
                             broker_server_id='deepseek', disable_reasoning=False,
                             base_url=cfg.model.broker_base_url.rstrip('/') + '/proxy/deepseek')
         elif values.get('DEEPSEEK_API_KEY'):
             values['GHA_MODEL_API_KEY'] = values['DEEPSEEK_API_KEY']
-            model = replace(cfg.model, model_id='your-second-model', auth_mode='env',
+            model = replace(cfg.model, model_id=DEEPSEEK_MODEL_ID, auth_mode='env',
                             base_url='https://api.deepseek.com', disable_reasoning=False)
         else:
             raise ValueError('DeepSeek is not connected. Supply the existing broker connection or a dedicated DEEPSEEK_API_KEY in the worker environment.')
     else:
         raise ValueError('Choose the GLM or DeepSeek fleet pool.')
-    resolved = replace(cfg, model=replace(model, max_calls_per_day=sys.maxsize,
+    daily = int((getattr(cfg, 'fleet_max_calls_per_day', None) or {}).get(provider) or 0) or sys.maxsize
+    resolved = replace(cfg, model=replace(model, max_calls_per_day=daily,
                                           max_calls_per_job=min(100, max(1, model.max_calls_per_job))))
     problems = model_auth_problems(resolved, values)
     if problems:

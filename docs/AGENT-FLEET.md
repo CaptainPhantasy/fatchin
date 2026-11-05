@@ -124,8 +124,25 @@ and the worker that wrote a finding does not take its own fix stage.
 
 | Pool | Model used | Maximum simultaneous tasks |
 | --- | --- | --- |
-| GLM | `your-model` through the existing GLM connection | 10 |
-| DeepSeek | `your-second-model`, the V4.1-Flash-1017 profile with a 1M-token context window | 10 |
+| GLM | `glm-5.3-flash` through the existing GLM connection | 10 |
+| DeepSeek | `deepseek-flash`, the V4.1-Flash-1017 profile with a 1M-token context window | 10 |
+
+Optional limits in `config.toml` (all off by default):
+
+```toml
+[model]
+min_seconds_between_calls = 1.5   # pacing per provider ledger; 0 = off
+
+[fleet_roles]                     # pin a task kind to a pool (only while that pool has workers)
+review_pr = "deepseek"
+fix_comment = "glm"
+
+[fleet_max_calls_per_day]         # per-provider daily stop (UTC); unset = no daily stop
+glm = 4000
+deepseek = 3000
+```
+
+Label a pull request `fatchin-halted` to stop new review and fix work on it.
 
 A **token** is a small piece of text counted by the model. The DeepSeek context
 window describes that model’s capacity; it does not remove FatChin’s individual

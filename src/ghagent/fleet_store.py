@@ -29,6 +29,13 @@ def identity(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()[:32]
 
 
+def _role_elsewhere(roles, kind, provider, fleet):
+    """[fleet_roles] pins a kind to a pool, but only while that pool has workers."""
+    pinned = (roles or {}).get(kind)
+    return bool(pinned and pinned != provider
+                and fleet.get('workers' if pinned == 'glm' else 'deepseek_workers', 0))
+
+
 class FleetStateError(ValueError):
     pass
 
@@ -518,7 +525,7 @@ class FleetStore:
         for item in terminal[:len(terminal) - keep]:
             data['items'].pop(item['id'], None)
 
-    def claim(self, slot):
+    def claim(self, slot, roles=None):
         if type(slot) is not int or not 1 <= slot <= MAX_WORKERS:
             raise ValueError('Invalid agent slot.')
         with self._locked(True) as data:
@@ -547,6 +554,7 @@ class FleetStore:
                         or not self._in_scope(fleet, item)
                         or item.get('eligible_at', '') > now() or fleet.get('error')
                         or (item.get('provider') and item['provider'] != provider)
+                        or (not item.get('provider') and _role_elsewhere(roles, item['kind'], provider, fleet))
                         or self._target(item) in targets
                         or any(repository_load.get(repo, 0) >= MAX_PER_REPOSITORY for repo in self._repositories(item))
                         or sum(i['fleet_id'] == fleet['id'] and i.get('provider', 'glm') == provider for i in active) >= fleet.get('workers' if provider == 'glm' else 'deepseek_workers', 0)):

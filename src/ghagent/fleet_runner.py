@@ -15,7 +15,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -1003,7 +1002,7 @@ def _model(cfg, env, item, factory):
         return
     from .fleet_providers import model_config
     resolved, model_env = model_config(cfg, env, provider)
-    model_cfg = dataclasses.replace(resolved.model, max_calls_per_job=100, max_calls_per_day=sys.maxsize)
+    model_cfg = dataclasses.replace(resolved.model, max_calls_per_job=100)
     bearer = make_bearer(dataclasses.replace(resolved, model=model_cfg), model_env)
     try:
         model = ModelClient(model_cfg, bearer, job_scope='fleet-' + str(item['id']),
