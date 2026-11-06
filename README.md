@@ -210,9 +210,30 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). The suite is offline and runs with:
 PYTHONPATH=src python3 -m unittest discover -s tests -t .
 ```
 
-## License
+## Why We Use the AGPL-3.0 License
 
-AGPL-3.0-or-later. See [LICENSE](LICENSE).
+At Floyd's Labs / Legacy AI, we built FatChin as a self-hosted review fleet: it reviews
+pull requests on your machine with your own model, checks them in a sandbox, proposes
+specific fixes, has a second worker review each fix, and leaves the merge to you. It
+saves small teams and solo engineers from burning cloud review budgets or per-seat
+invoices just to get a careful second pair of eyes.
+
+We release FatChin under the GNU Affero General Public License v3 (`AGPL-3.0-or-later`)
+for three plain reasons:
+
+- **Open Exchange:** We believe in putting real foundational building blocks into the
+  hands of independent developers, self-hosters and hobbyists for unhindered personal
+  and local use.
+- **The Give-Back Rule:** If you take FatChin, modify it and expose it to the public
+  over a network, such as a cloud app or hosted API service, the AGPL-3.0 requires you
+  to make your modified source code available under these same open rules.
+- **Passive Protection:** This license keeps our self-funded, independent lab work a
+  shared community asset. It stops proprietary platforms from repackaging our work into
+  closed-source commercial services without contributing back.
+
+If you are building tools for yourself, tinkering locally, or playing by the rules of
+open-source reciprocity, this is yours to use. See [`LICENSE`](LICENSE) for the full
+terms.
 
 ---
 
