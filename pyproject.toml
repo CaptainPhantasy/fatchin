@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fatchin"
-version = "0.1.0"
+version = "0.2.0"
 description = "Self-hosted GitHub review fleet with a human merge gate"
 readme = "README.md"
 requires-python = ">=3.11"
