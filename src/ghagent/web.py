@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import hashlib
 import json
 import mimetypes
 import os
@@ -41,7 +42,11 @@ class GuiServer(ThreadingHTTPServer):
     def _reload_tls(self, *, initial=False):
         try:
             stats = [p.stat() for p in self._tls_paths]
-            signature = tuple((s.st_mtime_ns, s.st_ino, s.st_size) for s in stats)
+            # In-place renewal can keep the same size and filesystem timestamp.
+            # Fingerprints stay in memory and are never returned or logged.
+            signature = tuple((s.st_mtime_ns, s.st_ino, s.st_size,
+                               hashlib.sha256(path.read_bytes()).digest())
+                              for path, s in zip(self._tls_paths, stats))
             if signature == self._tls_signature:
                 return
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -115,7 +120,7 @@ def handler_factory(control, *, web_root=WEB_ROOT):
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Referrer-Policy', 'same-origin')
             self.send_header('X-Frame-Options', 'DENY')
-            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; manifest-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
             for key, value in (extra or {}).items():
                 self.send_header(key, value)
             self.end_headers()
@@ -214,6 +219,13 @@ def handler_factory(control, *, web_root=WEB_ROOT):
                     raise ApiError('This application page or operation was not found.', 404)
                 if path in {'/', '/index.html'}:
                     target = web_root / 'index.html'
+                elif path in {'/favicon.ico', '/favicon.svg', '/favicon-16x16.png',
+                              '/favicon-32x32.png', '/apple-touch-icon.png',
+                              '/icon-192.png', '/icon-512.png', '/manifest.webmanifest',
+                              '/brand/fatchin-logo.png'}:
+                    target = (web_root / path.lstrip('/')).resolve()
+                    if not target.is_relative_to(web_root.resolve()):
+                        raise ApiError('Asset not found.', 404)
                 elif path.startswith('/static/'):
                     target = (web_root / unquote(path[len('/static/'):])).resolve()
                     if not target.is_relative_to(web_root.resolve()) or any(part.startswith('.') for part in target.relative_to(web_root.resolve()).parts):
@@ -228,7 +240,9 @@ def handler_factory(control, *, web_root=WEB_ROOT):
                     raise ApiError('Page not found.', 404)
                 if not target.is_file():
                     raise ApiError('This interface asset is not installed. Reinstall the matching GUI package.', 503)
-                mime = mimetypes.guess_type(str(target))[0] or 'application/octet-stream'
+                mime = {'.ico': 'image/vnd.microsoft.icon', '.svg': 'image/svg+xml',
+                        '.png': 'image/png', '.webmanifest': 'application/manifest+json'}.get(
+                            target.suffix, mimetypes.guess_type(str(target))[0] or 'application/octet-stream')
                 if target.suffix == '.md':
                     mime = 'text/plain; charset=utf-8'
                 self.send(target.read_bytes(), content_type=mime)

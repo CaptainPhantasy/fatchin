@@ -4,6 +4,7 @@ import hashlib
 import http.client
 import io
 import json
+import os
 import shutil
 import socket
 import ssl
@@ -120,6 +121,25 @@ class HttpsTests(GuiFixture, unittest.TestCase):
         self.activate('renewed')
         self.assertEqual(self.certificate_digest(), self.expected_digest('renewed'))
         self.assertEqual(self.request()[0], 200)
+
+    def test_same_size_renewal_is_detected_with_unchanged_file_timestamps(self):
+        # In-place rotations can share one filesystem timestamp tick. PEM trailing
+        # whitespace lets both real certificate/key pairs have identical sizes.
+        paths = [(self.cert, '.crt'), (self.key, '.key')]
+        lengths = {suffix: max((self.cert_root / (name + suffix)).stat().st_size
+                              for name in ['first', 'renewed']) + 8
+                   for _, suffix in paths}
+        for path, suffix in paths:
+            content = (self.cert_root / ('first' + suffix)).read_bytes()
+            path.write_bytes(content.ljust(lengths[suffix], b'\n'))
+        self.assertEqual(self.certificate_digest(), self.expected_digest('first'))
+        previous = {path: path.stat() for path, _ in paths}
+        for path, suffix in paths:
+            content = (self.cert_root / ('renewed' + suffix)).read_bytes()
+            path.write_bytes(content.ljust(lengths[suffix], b'\n'))
+            old = previous[path]
+            os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns))
+        self.assertEqual(self.certificate_digest(), self.expected_digest('renewed'))
 
     def test_incomplete_update_keeps_previous_certificate_then_recovers(self):
         self.cert.write_text('not a certificate')

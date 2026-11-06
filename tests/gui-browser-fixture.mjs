@@ -110,6 +110,15 @@ const waitFor = async (expression) => {
   }
   throw new Error("Timed out: " + expression);
 };
+// Wait for a Node-side condition (e.g. a fixture write landing) instead of a fixed sleep.
+const waitUntil = async (predicate, label) => {
+  for (let i = 0; i < 120; i++) {
+    if (predicate()) return;
+    await delay(50);
+  }
+  throw new Error("Timed out waiting for: " + label);
+};
+const draftWrites = () => writes.filter((w) => w.path.endsWith("/draft-action")).length;
 const screenshot = async (name) => {
   await delay(300);
   const r = await send("Page.captureScreenshot", {
@@ -248,6 +257,11 @@ async function route(request) {
       status = 503;
       result = { error: "Fixture connection unavailable" };
     } else result = fixture;
+  } else if (path === "/api/fleet") {
+    result = { version: 1, max_workers: 20, max_workers_per_provider: 10,
+      providers: [{ id: "glm", label: "GLM", available: true },
+        { id: "deepseek", label: "DeepSeek", available: true }],
+      fleets: [], workers: [], items: [], ready: [], comments: [], events: [] };
   } else if (path === "/api/github/user")
     result = {
       login: url.searchParams.get("login") || "connected-fixture",
@@ -905,18 +919,29 @@ try {
   );
   await waitFor(`document.querySelector('#draft-choice')`);
   await fill("#draft-choice", "1", "change");
-  await evaluate(`document.querySelector('button[form="draft-decision-form"]').click()`);
-  await new Promise((resolve) => setTimeout(resolve, 200));
+  {
+    const before = draftWrites();
+    await evaluate(`document.querySelector('button[form="draft-decision-form"]').click()`);
+    await waitUntil(() => draftWrites() > before, "draft-action write");
+  }
   assert(
     writes.some((w) => w.path === "/api/jobs/draft-job-1/draft-action" && w.data.name === "two"),
     "Multi-draft posting sends the selected second draft instead of defaulting to the first",
   );
+  assert(await evaluate("!document.querySelector('#draft-choice')&&!document.querySelector('#draft-body')"),
+    "Closing a completed decision removes stale draft controls before the next read");
   await evaluate(`document.querySelector('[data-action="draft-edit"]').click()`);
+  // Wait for the edit dialog itself (the post dialog uses the same field ids).
+  await modal("Edit your draft");
   await waitFor(`document.querySelector('#draft-body')`);
   await fill("#draft-choice", "1", "change");
+  await waitFor(`document.querySelector('#draft-choice').value==='1'`);
   await fill("#draft-body", "Revised second draft.");
-  await evaluate(`document.querySelector('button[form="draft-decision-form"]').click()`);
-  await new Promise((resolve) => setTimeout(resolve, 200));
+  {
+    const before = draftWrites();
+    await evaluate(`document.querySelector('button[form="draft-decision-form"]').click()`);
+    await waitUntil(() => draftWrites() > before, "draft-action write");
+  }
   assert(writes.at(-1).data.action === "edit" && writes.at(-1).data.name === "two" && writes.at(-1).data.body === "Revised second draft.",
     "Edit sends the selected draft name and actual edited body without posting");
   // An explicit confirmation must precede the only merge-capable task.
@@ -932,7 +957,7 @@ try {
   assert(writes.filter((w) => w.path.endsWith('/draft-action')).length === postsBefore,
     "A confirmation-required task cannot publish merely by choosing Post");
   await evaluate(`document.querySelector('#confirm-action').click()`);
-  await new Promise((resolve) => setTimeout(resolve, 200));
+  await waitUntil(() => draftWrites() > postsBefore, "confirmed draft-action write");
   assert(writes.at(-1).data.confirm === true && writes.at(-1).data.name === "one",
     "The separate confirmation sends confirm true with the exact selected draft");
   // The safety fence names what could land unverified and who may post.
