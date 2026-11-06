@@ -248,6 +248,11 @@ async function route(request) {
       status = 503;
       result = { error: "Fixture connection unavailable" };
     } else result = fixture;
+  } else if (path === "/api/fleet") {
+    result = { version: 1, max_workers: 20, max_workers_per_provider: 10,
+      providers: [{ id: "glm", label: "GLM", available: true },
+        { id: "deepseek", label: "DeepSeek", available: true }],
+      fleets: [], workers: [], items: [], ready: [], comments: [], events: [] };
   } else if (path === "/api/github/user")
     result = {
       login: url.searchParams.get("login") || "connected-fixture",
@@ -911,6 +916,8 @@ try {
     writes.some((w) => w.path === "/api/jobs/draft-job-1/draft-action" && w.data.name === "two"),
     "Multi-draft posting sends the selected second draft instead of defaulting to the first",
   );
+  assert(await evaluate("!document.querySelector('#draft-choice')&&!document.querySelector('#draft-body')"),
+    "Closing a completed decision removes stale draft controls before the next read");
   await evaluate(`document.querySelector('[data-action="draft-edit"]').click()`);
   await waitFor(`document.querySelector('#draft-body')`);
   await fill("#draft-choice", "1", "change");

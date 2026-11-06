@@ -1,0 +1,34 @@
+{
+  "session": {
+    "id": "commercial-lesson",
+    "version": 1,
+    "revision": 1,
+    "mode": "guide",
+    "lesson": "git-basics",
+    "repo": "owner/repo",
+    "ref": "main",
+    "account": "alice",
+    "output_dir": "/home/example/learning-results",
+    "status": "ready",
+    "step_index": 1,
+    "step": {
+      "id": "practice-edit",
+      "title": "Edit a practice file",
+      "intent": "Prepare a small change and inspect it before saving.",
+      "command": "Write lesson.txt",
+      "explanation": "This changes only your practice file, not the selected project.",
+      "memory_aid": "Inspect the change before committing it.",
+      "narration": "Read the prepared change. **Save your practice edit** when you are ready, then inspect the result before choosing the next move.",
+      "narration_source": "built-in",
+      "action_kind": "edit",
+      "instruction": "Write a short sentence in the practice file.",
+      "preview_content": "A clear, deliberate project change.\n"
+    },
+    "practice": { "filename": "lesson.txt", "content": "My practice project.\n", "dirty": false },
+    "receipts": [
+      { "step_id": "inspect", "command": "git status --short", "output": "Working tree clean.", "exit_code": 0, "at": "2026-11-06T12:00:00Z", "observed": true }
+    ],
+    "answer": "Reviewing the difference lets you check exactly what will be saved.",
+    "error": ""
+  }
+}
