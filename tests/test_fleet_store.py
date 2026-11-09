@@ -3,7 +3,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from ghagent.control_store import atomic_json
 from ghagent.fleet_store import FleetStore, FleetStateError
 
 
@@ -29,6 +31,28 @@ class FleetStoreTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.store = FleetStore(Path(self.temp.name) / 'fleet-v1')
         self.fleet = fleet(self.store)
+
+    def test_empty_claims_do_not_rewrite_saved_state(self):
+        previous = self.store.path.read_bytes()
+        with patch('ghagent.fleet_store.atomic_json', wraps=atomic_json) as write:
+            claims = [self.store.claim(slot) for slot in range(1, 21)]
+        self.assertEqual(claims, [None] * 20)
+        write.assert_not_called()
+        self.assertEqual(self.store.path.read_bytes(), previous)
+
+    def test_successful_claim_is_saved_before_returning(self):
+        self.store.upsert(self.fleet['id'], [candidate(1)])
+        with patch('ghagent.fleet_store.atomic_json', wraps=atomic_json) as write:
+            claimed = self.store.claim(1)
+        write.assert_called_once()
+        saved = FleetStore(self.store.root).internal()
+        item = saved['items'][claimed['id']]
+        self.assertEqual(item['status'], 'running')
+        self.assertEqual(item['lease'], claimed['lease'])
+        self.assertEqual(item['attempts'], 1)
+        self.assertEqual(item['history'][-1]['event'], 'claimed')
+        self.assertEqual(saved['workers']['1']['item_id'], item['id'])
+        self.assertEqual(saved['events'][-1]['item_id'], item['id'])
 
     def test_full_fleet_spans_at_least_five_repositories_with_four_per_project(self):
         from collections import Counter

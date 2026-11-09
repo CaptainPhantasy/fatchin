@@ -99,7 +99,7 @@ class StorePipelineTests(unittest.TestCase):
         self.assertEqual(self.store.snapshot()['fleets'][0]['calls_used'], 2)
         self.assertIsNone(self.store.claim(1))
 
-    def test_prune_keeps_a_bounded_number_of_terminal_items(self):
+    def test_prune_preserves_all_existing_terminal_history(self):
         data = {'items': {}}
         for index in range(5):
             data['items'][f'i{index}'] = {
@@ -107,7 +107,7 @@ class StorePipelineTests(unittest.TestCase):
                 'updated_at': f'2026-10-2{index}T00:00:00+00:00'}
         data['items']['live'] = {'id': 'live', 'fleet_id': self.fleet['id'], 'status': 'queued'}
         FleetStore._prune(data, self.fleet['id'], keep=2)
-        self.assertEqual(sorted(data['items']), ['i3', 'i4', 'live'])
+        self.assertEqual(sorted(data['items']), ['i0', 'i1', 'i2', 'i3', 'i4', 'live'])
 
 
 if __name__ == '__main__':

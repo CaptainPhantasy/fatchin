@@ -25,7 +25,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -400,118 +400,215 @@ class Worker:
         for key in ['output_dir', 'member', 'member_home']:
             if job.notes.get(key):
                 meta[key] = job.notes[key]
+        problem = self._watch_destination_problem(meta)
+        meta.update(watch_status='needs-folder' if problem else 'watching',
+                    status_reason=problem or 'Waiting for new eligible inline review feedback.',
+                    hold_reason=problem, last_checked_at=_now_iso())
         WatchStore(self.state_dir / WATCHED_FILE).put(repo, number, meta, only_new=True)
         self._load_watches()
 
+    @staticmethod
+    def _watch_destination_problem(meta):
+        """A saved subscription never supplies an implicit results folder."""
+        if not all(isinstance(meta.get(key), str) and meta[key].strip()
+                   for key in ('output_dir', 'member', 'member_home')):
+            return 'Choose your member account and results folder before automatic follow-up can start.'
+        try:
+            home = Path(meta['member_home']).resolve(strict=True)
+            output = Path(meta['output_dir']).resolve(strict=True)
+            if (not Path(meta['output_dir']).is_absolute() or output == home
+                    or not output.is_relative_to(home) or not output.is_dir()
+                    or not os.access(output, os.W_OK | os.X_OK)):
+                raise ValueError('invalid destination')
+        except (OSError, ValueError):
+            return 'The chosen results folder is unavailable. Edit this watch and choose a writable folder in your account.'
+        return ''
+
+    def _watch_status(self, store, repo, number, status, reason, *, error='', **extra):
+        """Merge health only, so a poll cannot replace an edited destination."""
+        timestamp = _now_iso()
+        patch = dict(watch_status=status, status_reason=reason,
+                     hold_reason=reason if status != 'watching' else '',
+                     last_checked_at=timestamp, last_error=error,
+                     next_check_at=(datetime.now(timezone.utc) + timedelta(
+                         seconds=self.cfg.poll_interval_seconds + self._backoff_seconds)).isoformat(timespec='seconds'),
+                     **extra)
+        if status not in {'lookup-failed', 'needs-folder', 'repository-removed', 'disabled'}:
+            patch['last_success_at'] = timestamp
+        store.put(repo, number, patch, only_existing=True)
+        if (str(number) != '*' and status != 'closed'
+                and self.watches.get(repo, {}).get(str(number), {}).get('scope') == 'all'):
+            # The UI intentionally collapses derived PR subscriptions into the
+            # all-PR row. Carry a child's hold to that visible row as well.
+            store.put(repo, '*', {**patch, 'last_checked_pr': int(number)}, only_existing=True)
+        current = self.watches.get(repo, {}).get(str(number))
+        if current is not None:
+            current.update(patch)
+        return patch
+
     def _poll_watched(self) -> int:
-        """Enqueue a fix job when a watched, open PR has new review comments."""
+        """Explain every watch hold while preserving its feedback cursor."""
         enqueued = 0
         today = datetime.now(timezone.utc).date()
         store = WatchStore(self.state_dir / WATCHED_FILE)
-        # Unit callers may seed self.watches directly; production always has a
-        # saved record, reread each poll so GUI edits are immediately visible.
         if store.path.exists():
             self.watches = store.read()
+        configured = {r.full_name for r in self.cfg.repos}
+        scope_scan_holds = {}
         for repo_name, entries in list(self.watches.items()):
+            for key, meta in list(entries.items()):
+                if meta.get('enabled') is False:
+                    self._watch_status(store, repo_name, key, 'disabled',
+                                       'This watch is paused. Edit it to enable automatic follow-up again.')
+                elif repo_name not in configured:
+                    self._watch_status(store, repo_name, key, 'repository-removed',
+                                       'This repository is no longer configured. Add it in Repositories or keep this watch paused.')
+                elif self._watch_destination_problem(meta):
+                    self._watch_status(store, repo_name, key, 'needs-folder', self._watch_destination_problem(meta))
             scope = entries.get('*')
-            if scope and repo_name in {r.full_name for r in self.cfg.repos}:
-                prs = self.gh.rest('GET', f'repos/{repo_name}/pulls', body={'state': 'open', 'per_page': 100}, paginate=True) or []
+            if (not scope or scope.get('enabled') is False or repo_name not in configured
+                    or self._watch_destination_problem(scope)):
+                continue
+            try:
+                prs = self.gh.rest('GET', f'repos/{repo_name}/pulls',
+                                   body={'state': 'open', 'per_page': 100}, paginate=True) or []
+                self._watch_status(store, repo_name, '*', 'watching',
+                                   'The latest check succeeded. New eligible inline review comments can start follow-up work.')
                 for pr in prs:
                     key = str(pr['number'])
                     if key in entries:
                         continue
                     comments = self.gh.rest('GET', f'repos/{repo_name}/pulls/{key}/comments', paginate=True) or []
-                    if '*' not in store.read().get(repo_name, {}):
-                        break  # The member removed the scope during the request.
-                    meta = {**scope, 'scope': 'all', 'title': pr.get('title', ''),
-                            'last_review_comment_id': max((int(c.get('id', 0)) for c in comments), default=0)}
-                    if store.put(repo_name, key, meta, only_new=True):
-                        entries[key] = meta
-        for repo_full_name, prs in sorted(self.watches.items()):
-            repo = next((r for r in self.cfg.repos
-                         if r.full_name == repo_full_name), None)
-            if repo is None:
-                continue  # repo removed from config: watch dormant, not lost
-            for number_s, meta in sorted(((k,v) for k,v in prs.items() if k != '*'), key=lambda kv: int(kv[0])):
+                    # Check scope under the same lock that creates its child.
+                    # Removing a watch during GitHub's reply cannot recreate it.
+                    def add_child(value):
+                        saved = value.get(repo_name, {})
+                        current_scope = saved.get('*')
+                        if (not current_scope or current_scope.get('enabled') is False
+                                or self._watch_destination_problem(current_scope) or key in saved):
+                            return None
+                        child = {**current_scope, 'scope': 'all', 'title': pr.get('title', ''),
+                                 'last_review_comment_id': max((int(c.get('id', 0)) for c in comments), default=0)}
+                        saved[key] = child
+                        return dict(child)
+                    child = store.change(add_child)
+                    if child is not None:
+                        entries[key] = child
+            except Exception as exc:
+                scope_scan_holds[repo_name] = self._watch_status(store, repo_name, '*', 'lookup-failed',
+                                   'GitHub could not be checked. Check this repository’s access or try again later.',
+                                   error='The latest GitHub lookup did not complete.')
+                self._log(f'watch repository lookup {repo_name} failed: {type(exc).__name__}')
+
+        # Keep the strongest child hold on the visible all-PR row. A healthy
+        # sibling must not hide an error or an exhausted daily allowance.
+        scope_holds = dict(scope_scan_holds)
+        rank = {'lookup-failed': 7, 'needs-folder': 6, 'daily-limit': 5,
+                'author-not-allowed': 4, 'task-in-progress': 3, 'queued': 2, 'closed': 1}
+        for repo_name, entries in sorted(self.watches.items()):
+            if repo_name not in configured:
+                continue
+            for number_s, meta in sorted(((k, v) for k, v in entries.items() if k != '*'), key=lambda kv: int(kv[0])):
+                if (meta.get('enabled') is False or meta.get('closed') or self._watch_destination_problem(meta)
+                        or (meta.get('scope') == 'all' and (not entries.get('*')
+                            or entries['*'].get('enabled') is False
+                            or self._watch_destination_problem(entries['*'])))):
+                    continue
                 number = int(number_s)
-                last_id = int(meta.get("last_review_comment_id") or 0)
-                since = str(meta.get("last_comment_at") or "")
                 try:
-                    pr = self.gh.pr_view(repo_full_name, number)
+                    pr = self.gh.pr_view(repo_name, number)
+                    if not isinstance(pr, dict) or not pr:
+                        raise ValueError('Pull request is unavailable')
+                    if str(pr.get('state', '')).upper() in ('CLOSED', 'MERGED'):
+                        patch = self._watch_status(store, repo_name, number, 'closed',
+                                                  'This pull request is closed. Its watch history is kept; no new follow-up will start.',
+                                                  closed=True, closed_at=_now_iso())
+                        continue
+                    comments = self.gh.rest('GET', f'repos/{repo_name}/pulls/{number}/comments',
+                                            body={'since': str(meta.get('last_comment_at') or ''),
+                                                  'per_page': POLL_PAGE_SIZE}, paginate=True) or []
                 except Exception as exc:
-                    self._log(f'watch PR lookup {repo_full_name}#{number} failed: {exc}')
+                    patch = self._watch_status(store, repo_name, number, 'lookup-failed',
+                                               'GitHub could not be checked. Check repository access or wait for the next check.',
+                                               error='The latest pull request or feedback lookup did not complete.')
+                    if meta.get('scope') == 'all':
+                        scope_holds[repo_name] = patch
+                    self._log(f'watch lookup {repo_name}#{number} failed: {type(exc).__name__}')
                     continue
-                if (pr or {}).get('state', '').upper() in ('CLOSED', 'MERGED'):
-                    del self.watches[repo_full_name][number_s]
-                    store.remove(repo_full_name, number_s)
-                    continue
-                try:
-                    comments = self.gh.rest(
-                        "GET", f"repos/{repo_full_name}/pulls/{number}/comments",
-                        body={"since": since, "per_page": POLL_PAGE_SIZE}, paginate=True
-                    ) or []
-                except Exception as exc:
-                    self._log(f"watch poll {repo_full_name}#{number} failed: {exc}")
-                    continue
-                fresh = [
-                    c for c in comments
-                    if COMMENT_MARKER not in (c.get("body") or "")
-                    and int(c.get("id") or 0) > last_id
-                    # A selected PR authorizes watching, not executing any
-                    # stranger's instructions. Use the same trusted command
-                    # users as /agent; marker-free owner comments remain valid
-                    # when owner and worker share a GitHub identity.
-                    and (c.get("user") or {}).get("id") in self.cfg.allowed_command_users
-                ]
-                if pr and not meta.get('stale_notified'):
+                last_id = int(meta.get('last_review_comment_id') or 0)
+                new_comments = [c for c in comments if COMMENT_MARKER not in (c.get('body') or '')
+                                and int(c.get('id') or 0) > last_id]
+                fresh = [c for c in new_comments
+                         if (c.get('user') or {}).get('id') in self.cfg.allowed_command_users]
+                latest = max(new_comments, key=lambda c: int(c.get('id') or 0), default=None)
+                evidence = {}
+                if latest:
+                    evidence['latest_feedback'] = {
+                        'id': latest.get('id'), 'author': (latest.get('user') or {}).get('login') or '',
+                        'url': latest.get('html_url') or '', 'created_at': latest.get('created_at') or '',
+                        'eligible': (latest.get('user') or {}).get('id') in self.cfg.allowed_command_users}
+                if not meta.get('stale_notified'):
                     updated = str(pr.get('updatedAt') or pr.get('updated_at') or '')
                     if _stale(updated, days=7) and str(pr.get('state', '')).upper() == 'OPEN':
-                        store.put(repo_full_name, number,
-                                  {'stale_notified': _now_iso()}, only_existing=True)
+                        store.put(repo_name, number, {'stale_notified': _now_iso()}, only_existing=True)
                         self._write_digest_event('stale-pr', {
-                            'repo': repo_full_name, 'number': number,
-                            'text': f"Pull request #{number} in {repo_full_name} has "
-                                    f"waited a week for a decision. Merging or closing "
-                                    f"stays with you."})
+                            'repo': repo_name, 'number': number,
+                            'text': f'Pull request #{number} in {repo_name} has waited a week for a decision. '
+                                    'Merging or closing stays with you.'})
+                auto_today = sum(1 for j in self.queue.all()
+                                 if j.dedup_key.startswith(f'{AUTO_DEDUP_PREFIX}{repo_name}:{number}:')
+                                 and (_parse_ts(j.created_at) or _parse_ts('1970-01-01')).date() == today)
+                evidence['auto_jobs_today'] = auto_today
+                evidence['cap_reset_at'] = ''
                 if not fresh:
-                    continue
-                latest = max(fresh, key=lambda c: int(c.get("id") or 0))
-                auto_today = sum(
-                    1 for j in self.queue.all()
-                    if j.dedup_key.startswith(
-                        f"{AUTO_DEDUP_PREFIX}{repo_full_name}:{number}:")
-                    and (_parse_ts(j.created_at) or _parse_ts("1970-01-01")).date() == today
-                )
-                if auto_today >= AUTO_JOBS_PER_PR_PER_DAY:
-                    self._log(f"auto-fix cap reached for {repo_full_name}#{number} "
-                              f"today ({auto_today}); new feedback waits until tomorrow")
-                    continue
-                if self.queue.find_open_by_repo_number(repo_full_name, number):
-                    continue  # Current work will collect this feedback; retry next poll.
-                meta["last_review_comment_id"] = int(latest.get("id") or 0)
-                meta["last_comment_at"] = latest.get("created_at") or meta.get("last_comment_at") or ""
-                if store.path.exists() and number_s not in store.read().get(repo_full_name, {}):
-                    continue  # A member removed this watch while GitHub replied.
-                head_sha = self._pr_head_sha(pr or {})
-                job = Job(
-                    job_id=new_job_id(),
-                    kind=JobKind.FIX_PR,
-                    repo_full_name=repo_full_name,
-                    number=number,
-                    command_comment_id=int(latest.get("id") or 0),
-                    requested_by=int(latest.get("user", {}).get("id") or 0),
-                    head_sha=head_sha,
-                    dedup_key=(f"{AUTO_DEDUP_PREFIX}{repo_full_name}:{number}:"
-                               f"{meta['last_review_comment_id']}"),
-                    created_at=_now_iso(),
-                    updated_at=_now_iso(),
-                    notes={"auto_watch": True, **{k:meta[k] for k in ['output_dir','member','member_home'] if k in meta}},
-                )
-                if self.queue.add(job):
-                    enqueued += 1
-                    self._log(f"auto-enqueued fix job for {repo_full_name}#{number} "
-                              f"(new review feedback, {len(fresh)} comment(s))")
-                store.put(repo_full_name, number_s, meta, only_existing=True)
+                    status = 'author-not-allowed' if new_comments else 'watching'
+                    reason = ('New feedback came from a person or bot who is not allowed to start automatic work. '
+                              'Review allowed GitHub users in Settings, or create a task yourself.' if new_comments else
+                              'The latest check succeeded. Waiting for new eligible inline review comments.')
+                elif auto_today >= AUTO_JOBS_PER_PR_PER_DAY:
+                    status = 'daily-limit'
+                    evidence['cap_reset_at'] = datetime.combine(today + timedelta(days=1),
+                                                               datetime.min.time(), timezone.utc).isoformat()
+                    reason = 'Six automatic follow-ups have already started for this pull request today. '
+                    reason += 'The new feedback is saved for the next UTC day, or you can create a task yourself.'
+                elif self.queue.find_open_by_repo_number(repo_name, number):
+                    status = 'task-in-progress'
+                    reason = 'A task for this pull request is already waiting or running. Open Tasks to follow it; this feedback is kept.'
+                else:
+                    eligible = max(fresh, key=lambda c: int(c.get('id') or 0))
+                    # Bind the newest destination under the watch lock. Edits
+                    # made while GitHub replied cannot be overwritten here.
+                    with store.lock():
+                        value = store._read()
+                        saved = value.get(repo_name, {}).get(number_s)
+                        if not saved or saved.get('enabled') is False or saved.get('closed'):
+                            continue
+                        if saved.get('scope') == 'all' and value.get(repo_name, {}).get('*', {}).get('enabled') is False:
+                            continue
+                        problem = self._watch_destination_problem(saved)
+                        if problem:
+                            continue
+                        job = Job(job_id=new_job_id(), kind=JobKind.FIX_PR, repo_full_name=repo_name,
+                                  number=number, command_comment_id=int(eligible.get('id') or 0),
+                                  requested_by=int(eligible.get('user', {}).get('id') or 0),
+                                  head_sha=self._pr_head_sha(pr),
+                                  dedup_key=f"{AUTO_DEDUP_PREFIX}{repo_name}:{number}:{eligible['id']}",
+                                  created_at=_now_iso(), updated_at=_now_iso(),
+                                  notes={'auto_watch': True, **{k: saved[k] for k in ('output_dir', 'member', 'member_home')}})
+                        if self.queue.add(job):
+                            enqueued += 1
+                        saved.update(last_review_comment_id=int(eligible['id']),
+                                     last_comment_at=eligible.get('created_at') or saved.get('last_comment_at') or '')
+                        atomic_write_json(store.path, value)
+                    status = 'queued'
+                    reason = 'New eligible feedback has queued a task. Open Tasks to follow its checks and results.'
+                patch = self._watch_status(store, repo_name, number, status, reason, **evidence)
+                if meta.get('scope') == 'all' and rank.get(status, 0) > rank.get(scope_holds.get(repo_name, {}).get('watch_status'), 0):
+                    scope_holds[repo_name] = patch
+        for repo_name, patch in scope_holds.items():
+            store.put(repo_name, '*', patch, only_existing=True)
+        if store.path.exists():
+            self.watches = store.read()
         return enqueued
 
     def parse_command(self, body: str, target_kind: str | None = None,

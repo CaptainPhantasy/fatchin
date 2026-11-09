@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fatchin"
-version = "0.2.0"
+dynamic = ["version"]
 description = "Self-hosted GitHub review fleet with a human merge gate"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,3 +37,12 @@ fatchin-web = "ghagent.web:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["ghagent*"]
+
+[tool.setuptools.data-files]
+"share/fatchin/web" = ["web/*.html", "web/*.js", "web/*.css", "web/*.svg", "web/*.png", "web/*.ico", "web/*.webmanifest"]
+"share/fatchin/web/fonts" = ["web/fonts/*.ttf", "web/fonts/*LICENSE*"]
+"share/fatchin/web/brand" = ["web/brand/*.png"]
+"share/fatchin/docs" = ["docs/*.md"]
+
+[tool.setuptools.dynamic]
+version = {attr = "ghagent.__version__"}

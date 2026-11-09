@@ -119,7 +119,9 @@ def _report_markdown(job):
         'failed': 'Check the reason above and retry when ready.',
     }.get(state, 'No action is needed right now.')
     lines += [f"**What only you can decide.** {yours}", '']
-    running = 'The review watch stays armed: new feedback on this work is handled automatically.'
+    running = ('Automatic follow-up was recorded for this work. Open Review watches to see whether it is checking feedback and where its results will go.'
+               if notes.get('auto_watch') else
+               'No automatic follow-up was recorded for this task. Open Review watches if you want to follow future review feedback.')
     lines += [f"**What keeps running on its own.** {running if state == 'done' else 'Nothing is running on its own for this task.'}", '']
     return '\n'.join(lines)
 

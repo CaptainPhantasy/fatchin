@@ -32,6 +32,8 @@ class RepoConfig:
     # the owner sets this, an unreadable ruleset is recorded as unverified
     # instead of holding every write. Everything else still blocks.
     allow_unknown_rulesets: bool = False
+    # None follows the fleet policy; an explicit repository choice wins.
+    allow_workflows: bool | None = None
 
     @property
     def full_name(self) -> str:
@@ -73,12 +75,28 @@ class Config:
     run_command_timeout_seconds: int = 600
     run_command_output_cap: int = 100_000
     poll_repos: bool = True         # poll issues/PRs for commands
+    secret_gate: dict = field(default_factory=dict)  # acknowledged safe scanner findings
     fleet_policy: dict = field(default_factory=dict)  # org opt-in / personal opt-out
     max_fleet_publications_per_repo_per_day: int = 12
     max_fleet_calls_total: int = 0  # 0 = no per-run ceiling
     # Optional fleet tables. Empty keeps the slot-based defaults.
     fleet_roles: dict = field(default_factory=dict)              # item kind -> "glm" | "deepseek"
     fleet_max_calls_per_day: dict = field(default_factory=dict)  # provider -> calls per UTC day
+
+    def allow_workflows_for(self, full_name: str) -> bool:
+        """Whether pushes to this repository may start GitHub Actions.
+
+        An explicit [[repos]] entry wins. Otherwise [fleet_policy].allow_workflows
+        decides, so a fleet covering many repositories does not need one entry
+        each. Absent both, the hold stays on.
+        """
+        wanted = (full_name or "").casefold()
+        for repo in self.repos:
+            if repo.full_name.casefold() == wanted:
+                if repo.allow_workflows is not None:
+                    return bool(repo.allow_workflows)
+                break
+        return bool(self.fleet_policy.get("allow_workflows", False))
 
     @staticmethod
     def load(path: str | Path) -> "Config":

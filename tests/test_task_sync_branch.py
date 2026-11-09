@@ -134,7 +134,9 @@ def make_job(**over):
                 kind=JobKind.SYNC_BRANCH, repo_full_name=REPO, number=0,
                 command_comment_id=0, requested_by=1, dedup_key="k",
                 notes={"values": {"source": SOURCE, "target": TARGET},
-                       'request': {'accept_no_checks': True}})
+                       'request': {'accept_no_checks': True},
+                       'planned_refs': {f'refs/heads/{SOURCE}': COMMIT,
+                                        f'refs/heads/{TARGET}': COMMIT}})
     data.update(over)
     return Job(**data)
 
@@ -253,9 +255,10 @@ class DraftExecutionTests(unittest.TestCase):
     def test_plan_reaches_waiting_on_you_with_no_remote_write(self):
         agent = DraftAgent()
         gh = happy_gh()
-        returned, queue, wt, _, git_rec, gh_rec = run_job(
-            make_job(), gh, cfg=self.cfg, wt=FakeWT(path=self.wt_path),
-            agent=agent)
+        with patch.object(sync_branch, 'prepare_plan'):
+            returned, queue, wt, _, git_rec, gh_rec = run_job(
+                make_job(), gh, cfg=self.cfg, wt=FakeWT(path=self.wt_path),
+                agent=agent)
 
         self.assertEqual(returned.state, JobState.WAITING_ON_YOU, returned.error)
         self.assertEqual(returned.notes["phase"], "waiting-on-you")
@@ -405,6 +408,8 @@ class ApplyTests(unittest.TestCase):
     def test_worktree_falls_back_to_the_job_notes(self):
         job = make_job(notes={"values": {"source": SOURCE, "target": TARGET},
                               'request': {'accept_no_checks': True},
+                              'planned_refs': {f'refs/heads/{SOURCE}': COMMIT,
+                                               f'refs/heads/{TARGET}': COMMIT},
                               "worktree_path": str(self.worktree)})
         context = self.context()
         context.pop("worktree")

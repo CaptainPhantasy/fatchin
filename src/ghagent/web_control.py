@@ -25,17 +25,48 @@ from .interfaces import Config, Job, JobKind, JobState, ModelConfig, RepoConfig
 from .queue import JobQueue, TERMINAL_STATES
 from .task_write_guard import GuardedGitHub, ensure_not_stopped
 from .worker import make_dedup_key, new_job_id
-from . import tasks
+from . import tasks, __version__
+from .recovery_control import RecoveryControls
 
-VERSION = '1.0.0'
+_VERSION_FILE = Path(__file__).resolve().parents[2] / 'VERSION'
+
+
+def _read_version() -> str:
+    """Read the single version file; never hardcode a version beside this."""
+    try:
+        text = _VERSION_FILE.read_text(encoding='utf-8').strip()
+    except OSError:
+        return __version__
+    return text or __version__
+
+
+def _build_stamp() -> str:
+    """Short commit plus a dirty marker: proves which build is actually running."""
+    root = _VERSION_FILE.parent
+    try:
+        sha = subprocess.run(['git', '-C', str(root), 'rev-parse', '--short=7', 'HEAD'],
+                             capture_output=True, text=True, timeout=5).stdout.strip()
+        dirty = subprocess.run(['git', '-C', str(root), 'status', '--porcelain'],
+                               capture_output=True, text=True, timeout=5).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return 'unknown'
+    if not sha:
+        return 'unknown'
+    return sha + ('-dirty' if dirty else '')
+
+
+VERSION = _read_version()
+BUILD = _build_stamp()
 REPO = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z')
 DESTINATION_ERROR = 'Error: No destination folder specified. Supply an output path within your user space.'
 
 
 class ApiError(Exception):
-    def __init__(self, message, status=400):
+    def __init__(self, message, status=400, *, hint="", actions=None):
         super().__init__(message)
         self.status = status
+        self.hint = hint
+        self.actions = list(actions or [])
 
 
 def iso():
@@ -51,7 +82,14 @@ def target_number(value):
 
 
 def toml_document(data):
-    """Serialize our flat documented TOML schema without discarding new fields."""
+    """Preserve every supported field, including nested fleet policy values."""
+    from datetime import date, time as datetime_time
+
+    def quote_key(item):
+        if not isinstance(item, str):
+            raise ApiError('A configuration field name must be text.')
+        return json.dumps(item, ensure_ascii=False)
+
     def value(item):
         if isinstance(item, bool):
             return 'true' if item else 'false'
@@ -59,25 +97,27 @@ def toml_document(data):
             return json.dumps(item, ensure_ascii=False)
         if isinstance(item, (int, float)):
             return str(item)
+        if isinstance(item, (datetime, date, datetime_time)):
+            return item.isoformat()
         if isinstance(item, list):
             return '[' + ', '.join(value(v) for v in item) + ']'
+        if isinstance(item, dict):
+            return '{' + ', '.join(f'{quote_key(k)} = {value(v)}' for k, v in item.items()) + '}'
         raise ApiError('An unsupported configuration value was supplied.')
-    tables = {'model', 'fleet_policy', 'fleet_roles', 'fleet_max_calls_per_day'}
     lines = ['# gha-worker configuration. Edited by the graphical interface.']
     for key, item in data.items():
-        if key not in tables | {'repos'}:
-            lines.append(f'{key} = {value(item)}')
+        if key not in {'repos', 'model'} or (key == 'repos' and item == []):
+            lines.append(f'{quote_key(key)} = {value(item)}')
     for repo in data.get('repos', []):
         lines.append('\n[[repos]]')
-        lines.extend(f'{key} = {value(item)}' for key, item in repo.items())
-    for table in sorted(tables):
-        if table in data:
-            lines.append(f'\n[{table}]')
-            lines.extend(f'{key} = {value(item)}' for key, item in data[table].items())
+        lines.extend(f'{quote_key(key)} = {value(item)}' for key, item in repo.items())
+    if 'model' in data:
+        lines.append('\n[model]')
+        lines.extend(f'{quote_key(key)} = {value(item)}' for key, item in data['model'].items())
     return '\n'.join(lines) + '\n'
 
 
-class WebControl:
+class WebControl(RecoveryControls):
     def __init__(self, config_path, env_path=None, *, gh=None, runner=subprocess.run, accounts=None):
         self.config_path = Path(config_path).expanduser()
         self.env_path = Path(env_path or '~/.config/gha-worker/env').expanduser()
@@ -135,13 +175,50 @@ class WebControl:
             }
         return state
 
+    def fleet_item(self, item_id):
+        item = next((row for row in self.fleet_state()['items'] if row['id'] == item_id), None)
+        if not item:
+            raise ApiError('This saved fleet item was not found. Open fleet history to choose another item.', 404, actions=['fleet'])
+        fleet = self.fleet_store().internal()['fleets'].get(item['fleet_id'], {})
+        return {'item': item, 'fleet': fleet}
+
+    def repository_access(self, repo):
+        repo = self.validate_repo(repo)
+        checked = iso()
+        try:
+            record = self.gh.rest('GET', f'repos/{repo}')
+            permissions = record.get('permissions') or {}
+            can_write = permissions.get('push') is True or permissions.get('admin') is True
+            return {'repo': repo, 'checked_at': checked, 'can_write': can_write,
+                    'message': 'GitHub confirms write access for the connected account.' if can_write else 'GitHub did not confirm write access for the connected account.',
+                    'next_step': 'Review the fleet’s selected projects before retrying; this check does not add the project to its scope.' if can_write else 'Ask this project’s owner to grant the connected GitHub account write access, or archive the old item if it no longer needs work.',
+                    'github_url': f'https://github.com/{repo}'}
+        except Exception as exc:
+            return {'repo': repo, 'checked_at': checked, 'can_write': False,
+                    'message': 'GitHub could not confirm access: ' + redact_text(str(exc))[:700],
+                    'next_step': 'Open this project on GitHub and check which account has access. Reconnect that account in Settings, or ask the project owner for access. Your saved work is kept.',
+                    'github_url': f'https://github.com/{repo}'}
+
+    def fleet_files(self, item_id):
+        saved = self.fleet_item(item_id)
+        item, fleet = saved['item'], saved['fleet']
+        report = item.get('result', {}).get('report_path')
+        if not report:
+            return {'items': [], 'message': 'No separate report file was saved for this attempt. The complete saved item is available with Download report.'}
+        parent, _ = self.account_path(fleet.get('account'), fleet.get('output_dir'))
+        path = Path(report)
+        if path.is_symlink() or not path.resolve().is_relative_to(parent.resolve()) or not path.is_file():
+            raise ApiError('The old report file is unavailable. Download the saved item record; its checks and history are still available.', 404)
+        content = path.read_bytes()[:100001]
+        return {'items': [{'name': path.name, 'path': str(path)}], 'content': redact_text(content[:100000].decode('utf-8', errors='replace')), 'truncated': len(content) > 100000}
+
     def fleet_action(self, data):
         from .config_loader import load_env_file
         from .fleet_providers import provider_status
         action = data.get('action')
         if action == 'configure_checks':
             return self.fleet_configure_checks(data)
-        if action not in {'start', 'pause', 'resume', 'stop', 'retry', 'refresh'}:
+        if action not in {'start', 'pause', 'resume', 'stop', 'retry', 'refresh', 'archive', 'restore', 'authorize_budget'}:
             raise ApiError('Choose Start, Pause, Resume, Stop, Retry, or Refresh for the agent fleet.')
         cfg = self.config()
         store = self.fleet_store()
@@ -186,7 +263,7 @@ class WebControl:
                 item_id = data.get('item_id', '')
                 if not isinstance(fleet_id, str) or not isinstance(item_id, str):
                     raise ApiError('Choose a saved fleet or work item.')
-                if action in {'resume', 'retry'}:
+                if action in {'resume', 'retry', 'authorize_budget'}:
                     identity = self.gh.rest('GET', 'user')
                     internal = store.internal()
                     fleet = internal.get('fleets', {}).get(fleet_id)
@@ -197,8 +274,8 @@ class WebControl:
                             fleet_id = fleet['id']
                     if fleet and identity.get('id') != fleet.get('github_id'):
                         raise ApiError('This fleet belongs to a different connected GitHub account. Reconnect that account before resuming.', 409)
-                store.control(action, fleet_id=fleet_id, item_id=item_id)
-            if action in {'start', 'resume', 'retry'} and not self.service()['active']:
+                outcome = store.control(action, fleet_id=fleet_id, item_id=item_id, additional_calls=data.get('additional_calls'), reason=str(data.get('reason') or '')[:1000])
+            if action in {'start', 'resume', 'retry', 'authorize_budget'} and not self.service()['active']:
                 result = self.runner(['systemctl', '--user', 'start', 'gha-worker.service'],
                                      capture_output=True, text=True, timeout=30)
                 if result.returncode:
@@ -207,7 +284,10 @@ class WebControl:
                     raise ApiError('The worker service could not start. Your fleet is saved and paused. Run Connection checks to see the service problem.', 503)
         except ValueError as exc:
             raise ApiError(str(exc), 400) from None
-        return self.fleet_state()
+        reply = self.fleet_state()
+        if action != 'start' and outcome.get('message'):
+            reply['hint'] = outcome['message']
+        return reply
 
     def fleet_configure_checks(self, data):
         """Save a missing project check in the same view, without a reset."""
@@ -407,6 +487,25 @@ class WebControl:
         """What could bill you or land unverified, per repository, in plain terms."""
         cfg = self.config()
         watched = self.watches().read()
+        watch_rows = []
+        for repo_name, entries in watched.items():
+            if not isinstance(entries, dict):
+                raise ApiError('Review watch state cannot be read. Existing records have been preserved.', 503)
+            for number, meta in entries.items():
+                if meta.get('scope') == 'all' and number != '*':
+                    continue
+                watch_rows.append({**meta, 'repo': repo_name,
+                                   'number': int(number) if number != '*' else None,
+                                   'mode': 'all' if number == '*' else 'selected'})
+        healthy_watches = self.watch_health(watch_rows)
+        active_states = {'watching', 'not-checked', 'queued', 'task-in-progress'}
+        watch_labels = {'watching': 'Watching for new feedback', 'not-checked': 'Waiting for first feedback check',
+                        'queued': 'Feedback task queued', 'task-in-progress': 'Feedback task in progress',
+                        'disabled': 'Watch stopped', 'needs-folder': 'Needs a results folder',
+                        'repository-removed': 'Project needs adding again', 'worker-stopped': 'Worker stopped',
+                        'paused': 'Feedback checks paused', 'closed': 'Pull request closed',
+                        'lookup-failed': 'GitHub check failed', 'daily-limit': 'Daily follow-up limit reached',
+                        'author-not-allowed': 'Feedback needs an allowed person'}
         authority = self.authority()
         usage = ControlStore(Path(cfg.state_dir) / 'model-call-counts.json').read()
         calls_today = usage.get('count', 0) if usage.get('date') == datetime.now(timezone.utc).date().isoformat() else 0
@@ -415,15 +514,20 @@ class WebControl:
             cancelled += len(job.notes.get('cancelled_copilot_runs') or [])
         repos = []
         for repo in cfg.repos:
-            entries = watched.get(repo.full_name) or {}
-            armed = (any(meta.get('scope') == 'all' for meta in entries.values())
-                     or any(str(k) != '*' for k in entries))
-            repos.append({'repo': repo.full_name,
+            rows = [row for row in healthy_watches if row['repo'] == repo.full_name]
+            active = [row for row in rows if row['health'] in active_states]
+            selected = (active or rows or [None])[0]
+            watch_state = watch_labels.get(selected['health'], 'Watch needs checking') if selected else 'No review watch selected'
+            watch_next_step = selected['next_step'] if selected else 'Open Review watches to choose a pull request and results folder for automatic follow-up.'
+            if active and len(active) < len(rows):
+                watch_state += '; some watches need attention'
+                watch_next_step = 'Open Review watches to follow active checks and repair the saved watches that need attention.'
+            repos.append({'repo': repo.full_name, 'configured': True,
                           'checks_configured': len(repo.checks),
                           'protection': 'safe' if repo.checks else 'no-checks',
-                          'watches_armed': bool(armed),
+                          'watches_armed': bool(active), 'watch_state': watch_state, 'watch_next_step': watch_next_step,
                           'post_authority': authority.mode(repo.full_name),
-                          'rulesets_readable': 'unknown',
+                          'rulesets_readable': 'unknown', 'rules_inspection': self.rules_inspection(repo.full_name),
                           'base_branch': repo.base_branch})
         coverage = self.fleet_overview()
         known = {r['repo'].casefold(): r for r in repos}
@@ -432,10 +536,15 @@ class WebControl:
             if name.casefold() in known:
                 known[name.casefold()]['fleet_managed'] = True
                 known[name.casefold()]['watches_armed'] |= watched_repo['status'] == 'watching'
+                if watched_repo['status'] == 'watching':
+                    known[name.casefold()].update(watch_state='Fleet watching for new work',
+                        watch_next_step='Open Fleet to inspect its saved scope and latest checks.')
             else:
-                repos.append({'repo': name, 'checks_configured': 0, 'protection': 'automatic',
+                repos.append({'repo': name, 'configured': False, 'checks_configured': 0, 'protection': 'automatic',
                     'watches_armed': watched_repo['status'] == 'watching', 'fleet_managed': True,
-                    'post_authority': authority.mode(name), 'rulesets_readable': 'unknown', 'base_branch': ''})
+                    'watch_state': 'Fleet watching for new work' if watched_repo['status'] == 'watching' else 'Fleet ' + str(watched_repo['status']).replace('-', ' '),
+                    'watch_next_step': 'Open Fleet to inspect its saved scope, status, and next step.',
+                    'post_authority': authority.mode(name), 'rulesets_readable': 'unknown', 'rules_inspection': self.rules_inspection(name), 'base_branch': ''})
         return {'repos': repos, 'copilot_runs_cancelled': cancelled,
                 'model_calls_today': calls_today + sum(coverage['usage'].values()),
                 'actions_runs_started_by_worker': 0,
@@ -444,45 +553,60 @@ class WebControl:
                         'commands are shown as “no-checks”.'}
 
     def digest(self, limit=200):
-        """The doorbell: done / waiting-on-you / watched, newest first."""
-        path = Path(self.config().state_dir) / 'digest.jsonl'
-        events = []
-        try:
-            with open(path, 'r', encoding='utf-8') as handle:
-                for line in handle.readlines()[-limit:]:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        events.append(json.loads(line))
-                    except ValueError:
-                        continue
-        except FileNotFoundError:
-            pass
-        events.sort(key=lambda e: e.get('at', ''), reverse=True)
-        waiting = [json.loads(j.to_json()) for j in self.queue().all()
-                   if j.state is JobState.WAITING_ON_YOU]
-        watches = []
-        for repo, entries in self.watches().read().items():
-            for number, meta in entries.items():
-                if meta.get('scope') == 'all' and number != '*':
-                    continue
-                watches.append({'repo': repo, 'number': number,
-                                'mode': 'all' if number == '*' else 'selected'})
-        waits_events = [e for e in events if e.get('kind') in ('watched', 'stale-pr')][:50]
+        """Every saved outcome stays reachable, even when its worker is stopped."""
+        jobs = [json.loads(j.to_json()) for j in self.queue().all() if not j.notes.get('archived_at')]
+        done, waits = [], []
+        for job in jobs:
+            row = {'job_id': job['job_id'], 'repo': job['repo_full_name'], 'number': job['number'],
+                   'task': job['kind'], 'at': job['updated_at'], 'text': job['notes'].get('agent_summary') or job.get('error') or job['notes'].get('title') or 'Open this task to read its result.'}
+            if job['state'] == 'done':
+                done.append(row)
+            elif job['state'] in {'failed', 'stopped'}:
+                row['text'] = job.get('error') or 'This task stopped before finishing. Open it to read the evidence, correct its request, or archive it.'
+                waits.append(row)
         coverage = self.fleet_overview()
+        path = Path(self.config().state_dir) / 'digest.jsonl'
+        historical_watches = []
+        if path.exists():
+            for line in path.read_text(encoding='utf-8').splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    waits.append({'text': 'An older update could not be read. Its original record is kept; open setup checks for help.', 'at': '', 'kind': 'unreadable-history'})
+                    continue
+                if event.get('job_id') in {j['job_id'] for j in jobs}:
+                    continue
+                if event.get('kind') == 'done':
+                    done.append(event)
+                elif event.get('kind') in {'waiting-on-you', 'stale-pr'}:
+                    waits.append(event)
+                elif event.get('kind') == 'watched':
+                    historical_watches.append(event)
+        for item in self.fleet_store().snapshot().get('items', []):
+            if item.get('archived_at'):
+                continue
+            row = {'fleet_item': True, 'item_id': item['id'], 'fleet_id': item['fleet_id'],
+                   'task': item['kind'], 'repo': item['repo'], 'number': item.get('number'),
+                   'at': item.get('updated_at'), 'text': item.get('error') or item.get('result', {}).get('summary') or item.get('title'),
+                   'recovery': item.get('recovery', {})}
+            from .recovery import failed_checks
+            if item['status'] == 'done' and not failed_checks(item):
+                done.append(row)
+            elif item['status'] in {'blocked', 'failed'} or failed_checks(item):
+                waits.append(row)
+        watches = self.watch_health([dict(meta, repo=repo, number=None if key == '*' else int(key), mode='all' if key == '*' else 'selected')
+            for repo, entries in self.watches().read().items() for key, meta in entries.items()
+            if key == '*' or meta.get('scope') != 'all'])
         watched_names = {w['repo'].casefold() for w in watches}
-        watches += [{'kind': 'fleet-watch', **r, 'mode': 'all'} for r in coverage['repositories']
-                    if r['repo'].casefold() not in watched_names]
-        fleet_events = [{'kind': 'done' if i['status'] == 'done' else 'waiting-on-you',
-            'fleet_item': True, 'task': i['kind'], 'repo': i['repo'], 'number': i.get('number'),
-            'message': i.get('error') or i.get('title'), 'at': i.get('updated_at')}
-            for i in coverage['recent_tasks'] if i['status'] in {'done', 'blocked'}]
-        events = sorted(events + fleet_events, key=lambda e: e.get('at') or '', reverse=True)
-        return {'done': [e for e in events if e.get('kind') == 'done'][:50],
-                'waiting_on_you': {'events': [e for e in events if e.get('kind') == 'waiting-on-you'][:50],
-                                   'drafts': waiting},
-                'watched': waits_events + [{'kind': 'watch', **w} for w in watches]}
+        watches.extend(dict(row, mode='all', text=('This fleet is following ' if row['status'] == 'watching' else 'This fleet is paused for ') + row['repo'] + '. Open Agent fleet to read its current work.')
+                       for row in coverage['repositories'] if row['repo'].casefold() not in watched_names)
+        return {'done': sorted(done, key=lambda x: x.get('at') or '', reverse=True)[:limit],
+                'waiting_on_you': {'events': sorted(waits, key=lambda x: x.get('at') or '', reverse=True),
+                                   'drafts': [j for j in jobs if j['state'] == 'waiting-on-you']},
+                'watched': historical_watches + [dict(w, text=w.get('text') or w.get('status_reason') or w.get('next_step') or 'Open Review watches to see what this watch is doing.') for w in watches],
+                'hint': '', 'actions_available': ['jobs', 'fleet', 'watches']}
 
     def accounts(self):
         if self._accounts is not None:
@@ -581,7 +705,7 @@ class WebControl:
         return service
 
     def require_idle(self):
-        if self.service().get('current_job_id') or any(j.state not in TERMINAL_STATES for j in self.queue().all()):
+        if self.service().get('current_job_id') or any(j.state not in TERMINAL_STATES | {JobState.WAITING_ON_YOU} for j in self.queue().all()):
             raise ApiError('The worker has queued or running tasks. Stop those tasks first and wait for the current step to finish.', 409)
         from .fleet_store import FleetStore
         fleet = FleetStore(Path(self.config().state_dir) / 'fleet-v1').snapshot()
@@ -605,6 +729,7 @@ class WebControl:
                     continue
                 watches.append({**meta, 'repo': repo, 'number': int(number) if number != '*' else None,
                                 'mode': 'all' if number == '*' else 'selected'})
+        watches = self.watch_health(watches)
         jobs = [json.loads(j.to_json()) for j in self.queue().all()]
         jobs.reverse()
         usage = ControlStore(Path(cfg.state_dir) / 'model-call-counts.json').read()
@@ -617,7 +742,11 @@ class WebControl:
                 raise ApiError('Model usage records have an invalid date. Existing data has been preserved.', 503) from None
         calls_today = usage.get('count', 0) if usage.get('date') == datetime.now(timezone.utc).date().isoformat() else 0
         fleet_summary = self.fleet_overview()
-        return {'version': VERSION, 'service': service, 'github': self.github_status(), 'model': dataclasses.asdict(cfg.model),
+        from .config_loader import load_env_file
+        from .fleet_providers import provider_status
+        providers = provider_status(cfg, {**os.environ, **load_env_file(self.env_path)})
+        return {'version': VERSION, 'build': BUILD, 'service': service, 'github': self.github_status(), 'model': dataclasses.asdict(cfg.model),
+                'providers': providers,
                 'fleet_summary': fleet_summary,
                 'summary': {'jobs_open': sum(j['state'] not in {s.value for s in TERMINAL_STATES} for j in jobs),
                             'jobs_done_today': health.get('jobs_done_today', 0), 'model_calls_today': calls_today},
@@ -767,11 +896,13 @@ class WebControl:
             self.queue().stop_job(job_id)
             return {'job': json.loads(self.queue().get(job_id).to_json())}
         if action == 'retry':
+            if job.notes.get('posting') or job.notes.get('publish_outcome') == 'uncertain':
+                raise ApiError('The previous publication is not confirmed. Open this task and check GitHub before making a new publishing decision. Its evidence is kept.', 409, actions=['jobs'])
             if job.state not in {JobState.FAILED, JobState.STOPPED}:
                 raise ApiError('Only failed or stopped tasks can be retried.', 409)
             original = job.notes.get('request')
             if isinstance(original, dict) and original.get('repo') and original.get('kind'):
-                return self.enqueue(original)  # keeps every input the first run used
+                return self.enqueue({**original, **original.get('values', {})})  # restore every field from the saved request
             return self.enqueue({'repo': job.repo_full_name, 'kind': job.kind.value, 'number': job.number,
                                  'output_dir': job.notes.get('output_dir'), 'account': job.notes.get('member')})
         raise ApiError('This task action is not supported.')
@@ -992,12 +1123,21 @@ class WebControl:
         wt = job.notes.get('worktree_path')
         if not wt:
             return
+        if job.notes.get('output_dir'):
+            try:
+                from .results import export_worktree
+                export_worktree(job, wt)
+                job.notes.pop('result_export_error', None)
+            except Exception as exc:
+                job.notes['result_export_error'] = str(exc)[:300]
+                job.notes['worktree_cleanup'] = 'Scratch retained because result export failed. Correct the destination access before recovery.'
+                return
         try:
             from .wiring import WorktreeOpsAdapter
-            ops = WorktreeOpsAdapter(self.config())
-            ops.remove_worktree(wt)
-            ops.prune()
-            job.notes.pop('worktree_path', None)
+            from .executor import cleanup_owned_checkout
+            cfg = self.config()
+            ops = WorktreeOpsAdapter(cfg)
+            cleanup_owned_checkout(ops, cfg, job, wt)
         except Exception:
             job.notes['worktree_cleanup'] = 'Scratch retained; remove it by hand once the task is finished.'
 
@@ -1035,6 +1175,10 @@ class WebControl:
         return {'ok': True, 'restart_required': True}
 
     def validate_settings(self, cfg):
+        from .config_loader import fleet_table_problems
+        problems = fleet_table_problems(cfg)
+        if problems:
+            raise ApiError(' '.join(problems))
         from .config_loader import fleet_table_problems
         problems = fleet_table_problems(cfg)
         if problems:
@@ -1116,13 +1260,18 @@ class WebControl:
                 repos.append(value)
         result = self.change_config(data, update)
         try:
-            # A newly added repository is protected from day one: its open
-            # pull requests are watched for review feedback immediately.
+            # Prepare a visible setup step. A project save does not authorize
+            # model requests or choose a member's results folder.
             self.watches().put(full, '*', {'scope': 'all', 'armed_at': iso(),
-                                           'source': 'repo-added'}, only_new=True)
+                                           'source': 'repo-added', 'enabled': False,
+                                           'setup_required': True}, only_new=True)
         except Exception:
-            pass  # best effort; the safety fence reports whether a watch is armed
-        return {**result, 'repo': full}
+            return {**result, 'repo': full, 'hint': 'Repository saved. Its review watch could not be prepared. Open Review watches and choose Create a review watch to finish setup.',
+                    'actions_available': ['open-watches']}
+        saved = self.watches().read().get(full, {}).get('*') or {}
+        return {**result, 'repo': full, 'watch_setup_required': bool(saved.get('setup_required')),
+                'hint': ('Repository saved. Finish watch setup to choose a results folder and enable automatic follow-up. Apply the saved repository settings with an idle-worker restart.'
+                         if saved.get('setup_required') else 'Repository saved. Restart the idle worker to apply the settings.')}
 
     def remove_repo(self, data):
         full = self.validate_repo(data.get('repo'))
@@ -1134,23 +1283,52 @@ class WebControl:
             raw['repos'] = [r for r in raw.get('repos', []) if f'{r["owner"]}/{r["name"]}' != full]
         return self.change_config(data, update)
 
+    def stop_watch(self, data):
+        repo = self.validate_repo(data.get('repo'))
+        mode = data.get('mode')
+        if mode not in {'all', 'selected'}:
+            raise ApiError('Choose the review watch you want to stop.')
+        key = '*' if mode == 'all' else str(target_number(data.get('number')))
+        def update(rows):
+            entries = rows.get(repo, {})
+            if key not in entries:
+                raise ApiError('This saved watch was not found. Refresh Review watches.', 404)
+            keys = [k for k, meta in entries.items() if k == key or (key == '*' and meta.get('scope') == 'all')]
+            for number in keys:
+                entries[number].update(enabled=False, stopped_at=iso(), status_reason='You stopped this watch. Its earlier feedback positions and history are kept.')
+                entries[number].pop('setup_required', None)
+        self.watches().change(update)
+        return {'ok': True, 'hint': 'Watch stopped. Its history and feedback positions are kept. Edit watch can enable it again.'}
+
     def add_watch(self, data):
         repo = self.validate_repo(data.get('repo'), configured=True)
         output = self.destination(data)
         mode = data.get('mode', 'selected')
+        if mode not in {'all', 'selected'}:
+            raise ApiError('Choose a selected pull request or all open pull requests.')
+        key = '*' if mode == 'all' else str(target_number(data.get('number')))
+        existing = self.watches().read().get(repo, {}).get(key)
+        if existing and existing.get('setup_required') and mode == 'all':
+            return self.edit_watch({**data, 'enabled': True})
+        if existing:
+            raise ApiError('This feedback is already covered by a saved watch. Open Review watches and choose Edit watch to change its folder while keeping its history.', 409,
+                           actions=['open-watches'])
         meta = {'authorized_at': iso(), 'output_dir': output, 'member': data['account'],
-                'member_home': self.member_home(data['account']), 'scope': mode}
+                'member_home': self.member_home(data['account']), 'scope': mode,
+                'enabled': True, 'watch_status': 'not-checked',
+                'status_reason': 'Watch saved. The next polling check will inspect new feedback.'}
         if mode == 'selected':
             item = self.target(repo, 'fix-pr', data.get('number'))
             if str(item.get('state', '')).upper() != 'OPEN':
                 raise ApiError('A closed or merged pull request cannot be watched.', 409)
             comments = self.gh.rest('GET', f'repos/{repo}/pulls/{int(data["number"])}/comments', paginate=True) or []
             meta.update(last_review_comment_id=max((int(c['id']) for c in comments), default=0), title=item.get('title', ''))
-            self.watches().put(repo, int(data['number']), meta)
+            created = self.watches().put(repo, int(data['number']), meta, only_new=True)
         elif mode == 'all':
-            self.watches().put(repo, '*', meta)
-        else:
-            raise ApiError('Choose a selected pull request or all open pull requests.')
+            created = self.watches().put(repo, '*', meta, only_new=True)
+        if not created:
+            raise ApiError('This watch was saved in another window. Open Review watches and edit its current settings; its feedback history is kept.', 409,
+                           actions=['open-watches'])
         return {'ok': True}
 
     def service_action(self, data):
@@ -1190,9 +1368,13 @@ class WebControl:
         problems = model_auth_problems(cfg, env)
         checks.append({'name': 'Model credentials', 'status': 'fail' if problems else 'pass',
                        'message': ' '.join(problems) if problems else 'Credential source is configured. No model request was made.'})
-        return {'checks': checks}
+        checks.extend(self.contextual_diagnostics())
+        return {'checks': checks, 'hint': 'These are setup and recovery checks. A saved credential is not proof that a provider is reachable; test that provider separately.'}
 
     def provider_check(self, data):
+        provider = data.get('provider')
+        if provider in {'glm', 'deepseek'}:
+            return self.check_fleet_provider(provider, data)
         if data.get('confirmed') is not True:
             raise ApiError('Confirm the single provider request before running this check.')
         if not self._probe_lock.acquire(blocking=False):
@@ -1203,9 +1385,102 @@ class WebControl:
         finally:
             self._probe_lock.release()
 
+    def check_fleet_provider(self, provider, data):
+        if data.get('confirmed') is not True:
+            raise ApiError('Choose Send one test request to check this provider. It may use your provider allowance.', hint='No request was sent.', actions=['settings'])
+        if not self._probe_lock.acquire(blocking=False):
+            raise ApiError('A connection test is already running. Wait for its result.', 409)
+        bearer = None
+        try:
+            from .config_loader import load_env_file
+            from .fleet_providers import model_config
+            from .model_client import ModelClient
+            from .wiring import make_bearer
+            cfg, env = model_config(self.config(), {**os.environ, **load_env_file(self.env_path)}, provider)
+            cfg = dataclasses.replace(cfg, model=dataclasses.replace(cfg.model, max_tokens=64, max_calls_per_job=1))
+            bearer = make_bearer(cfg, env)
+            client = ModelClient(cfg.model, bearer, job_scope='connection-test-' + iso(),
+                                 day_counter_path=str(Path(cfg.state_dir) / 'fleet-v1' / (provider + '-model-call-counts.json')), max_attempts=1)
+            client.chat([{'role': 'user', 'content': 'Reply with OK.'}])
+            outcome = {'ok': True, 'output': 'The ' + provider + ' provider answered one test request. No coding task or GitHub change was made.'}
+        except Exception as exc:
+            outcome = {'ok': False, 'output': redact_text(str(exc))[:2000], 'hint': 'Check this provider’s saved credential and address, then send a new test only when ready.'}
+        finally:
+            if bearer is not None:
+                close = getattr(bearer, 'close', None)
+                if callable(close):
+                    close()
+            self._probe_lock.release()
+        ControlStore(Path(self.config().state_dir) / 'provider-tests.json').change(lambda rows: rows.update({provider: {**outcome, 'checked_at': iso()}}))
+        return outcome
+
+    def rules_inspection(self, repo):
+        return ControlStore(Path(self.config().state_dir) / 'rules-inspections.json').read().get(repo, {'state': 'not-checked', 'reason': "I don't know yet. Choose Inspect rules to check GitHub.", 'checked_at': None})
+
+    @staticmethod
+    def _provider_env_document(env):
+        """Keep the existing environment readable by both the worker and systemd."""
+        lines = []
+        for key, value in env.items():
+            if any(c in value for c in '\r\n\x00'):
+                raise ApiError('An existing environment value cannot be preserved safely. Ask the maintainer to correct the environment file.')
+            if "'" not in value:
+                lines.append(f"{key}='{value}'")
+            elif '"' not in value and '\\' not in value:
+                lines.append(f'{key}="{value}"')
+            else:
+                raise ApiError('An existing environment value cannot be preserved safely. Ask the maintainer to correct the environment file.')
+        return ('\n'.join(lines) + '\n').encode()
+
+    def set_provider_source(self, data):
+        """A person's explicit source choice changes no secret or provider allowance."""
+        from .config_loader import load_env_file
+        from .fleet_providers import model_config, provider_status
+        provider, source = data.get('provider'), data.get('source')
+        if provider != 'deepseek' or source not in {'env', 'broker-lease'}:
+            raise ApiError('Choose the dedicated DeepSeek key or company broker connection.', actions=['settings'])
+        with ControlStore(self.config_path.with_suffix('.edit')).lock(), ControlStore(self.env_path.with_suffix('.edit')).lock():
+            env = load_env_file(self.env_path)
+            old_source = env.get('FATCHIN_DEEPSEEK_AUTH_MODE') or 'automatic'
+            proposed = {**os.environ, **env, 'FATCHIN_DEEPSEEK_AUTH_MODE': source}
+            try:
+                model_config(self.config(), proposed, 'deepseek')
+            except ValueError as exc:
+                raise ApiError(str(exc), 409, hint='No source or credential was changed. Store the missing credential first, or choose another saved connection.', actions=['settings']) from None
+            history = ControlStore(Path(self.config().state_dir) / 'provider-source-history.json')
+            history.read()
+            controls = self.controls()
+            controls.read()
+            previous_env = self.env_path.read_bytes() if self.env_path.exists() else None
+            previous_history = history.path.read_bytes() if history.path.exists() else None
+            previous_controls = controls.path.read_bytes() if controls.path.exists() else None
+            env['FATCHIN_DEEPSEEK_AUTH_MODE'] = source
+            content = self._provider_env_document(env)
+            for path in (self.env_path, history.path, controls.path):
+                backup(path)
+            try:
+                atomic_bytes(self.env_path, content)
+                history.change(lambda rows: rows.setdefault('deepseek', []).append({
+                    'at': iso(), 'previous_source': old_source, 'selected_source': source,
+                    'reported_by': 'user', 'credential_changed': False}))
+                controls.change(lambda control: control.update(config_revision=self.revision()))
+            except Exception:
+                restore_optional(self.env_path, previous_env)
+                restore_optional(history.path, previous_history)
+                restore_optional(controls.path, previous_controls)
+                raise ApiError('The DeepSeek connection choice could not be saved. The previous choice and credentials were restored; try again after opening setup checks.', 503, actions=['diagnostics']) from None
+            row = next(row for row in provider_status(self.config(), proposed) if row['id'] == 'deepseek')
+        return {'ok': True, 'restart_required': True, 'provider': row,
+                'hint': 'DeepSeek will use ' + row['credential_source_label'].lower() + ' after you apply the saved settings. No model request was sent and no credential was replaced.',
+                'actions_available': ['settings']}
+
     def credential(self, data):
-        names = {'model': 'GHA_MODEL_API_KEY', 'broker': 'MCP_SECRET_BROKER_ADMIN_TOKEN'}
+        names = {'model': 'GHA_MODEL_API_KEY', 'deepseek': 'DEEPSEEK_API_KEY', 'broker': 'MCP_SECRET_BROKER_ADMIN_TOKEN', 'deepseek-broker': 'MCP_SECRET_BROKER_ADMIN_TOKEN'}
         name = names.get(data.get('kind'))
+        selected_source = data.get('provider_source')
+        if selected_source is not None and (data.get('kind'), selected_source) not in {
+                ('deepseek', 'env'), ('broker', 'broker-lease'), ('deepseek-broker', 'broker-lease')}:
+            raise ApiError('Choose the dedicated DeepSeek key for its direct connection, or the company broker credential for the broker connection.')
         value = str(data.get('value', '')).strip()
         supplied = str(data.get('supplied_by', '')).strip()
         if not name or not value or len(value) > 10000 or any(c.isspace() or c in '\x00\"\'\\' for c in value) or not supplied:
@@ -1218,6 +1493,13 @@ class WebControl:
             self.controls().read()
             env = load_env_file(self.env_path)
             env[name] = value
+            if selected_source is not None:
+                env['FATCHIN_DEEPSEEK_AUTH_MODE'] = selected_source
+                from .fleet_providers import model_config
+                try:
+                    model_config(self.config(), {**os.environ, **env}, 'deepseek')
+                except ValueError as exc:
+                    raise ApiError(str(exc), 409, hint='No credential was replaced. Review the chosen DeepSeek connection.', actions=['settings']) from None
             previous_env = self.env_path.read_bytes() if self.env_path.exists() else None
             backup(self.env_path)
             backup(records.path)
@@ -1237,9 +1519,11 @@ class WebControl:
                         raise ApiError('An existing environment value cannot be preserved safely. Ask the maintainer to correct the environment file.')
                 handle.flush(); os.fsync(handle.fileno())
             os.replace(temp, self.env_path)
-            description = {'what': 'Model provider API credential' if name == 'GHA_MODEL_API_KEY' else 'Company broker administration credential',
-                           'does': 'Authenticates gha-worker model requests' if name == 'GHA_MODEL_API_KEY' else 'Mints short-lived model access leases for gha-worker',
+            description = {'what': 'DeepSeek fleet API credential' if name == 'DEEPSEEK_API_KEY' else 'Model provider API credential' if name == 'GHA_MODEL_API_KEY' else 'Company broker administration credential',
+                           'does': 'Authenticates DeepSeek fleet model requests' if name == 'DEEPSEEK_API_KEY' else 'Authenticates gha-worker model requests' if name == 'GHA_MODEL_API_KEY' else 'Mints short-lived model access leases for gha-worker',
                            'not': 'Not GitHub authentication or application access', 'supplied_by': supplied, 'supplied_at': iso()}
+            if selected_source is not None:
+                description['selected_deepseek_source'] = selected_source
             try:
                 records.change(lambda entries: entries.update({name: description}))
                 self.controls().change(lambda control: control.update(config_revision=self.revision()))
@@ -1314,12 +1598,30 @@ class WebControl:
         job = self.queue().get(job_id)
         if not job:
             raise ApiError('Task not found.', 404)
+        recoverable = job.state in TERMINAL_STATES | {JobState.WAITING_ON_YOU}
         output = job.notes.get('output_dir')
         if not output:
-            raise ApiError('This older task has no selected result folder. Its history and GitHub links remain available.', 404)
-        parent, _ = self.account_path(job.notes.get('member'), output)
+            if not recoverable:
+                raise ApiError('This task has no selected result folder yet.', 404,
+                               hint='Wait for its current step to finish, or download its saved report now. To choose a new result folder, stop the task first.',
+                               actions=['download-report'])
+            raise ApiError('This task has no selected result folder. Its saved record and GitHub links are kept.', 404,
+                           hint='Choose Save existing results elsewhere to select a folder, or Download report to read its saved record. No model work or GitHub action will be repeated.',
+                           actions=['save-results', 'download-report'])
+        try:
+            parent, _ = self.account_path(job.notes.get('member'), output)
+        except ApiError as exc:
+            if not recoverable:
+                raise
+            raise ApiError('The recorded result folder cannot be opened. ' + str(exc), 404,
+                           hint='Choose Save existing results elsewhere to copy any retained files, or Download report to read its saved record. Earlier records and files are kept.',
+                           actions=['save-results', 'download-report']) from None
         root = parent / ('gha-worker-' + job.job_id)
         if root.is_symlink() or not root.is_dir():
+            if recoverable:
+                raise ApiError('This task has no saved files in its recorded result folder.', 404,
+                               hint='Choose Save existing results elsewhere to copy any retained files, or Download report to read its saved record. No model work or GitHub action will be repeated.',
+                               actions=['save-results', 'download-report'])
             raise ApiError('This task has not exported result files yet. Refresh after its current step finishes.', 404)
         root = root.resolve()
         target = (root / relative).resolve()

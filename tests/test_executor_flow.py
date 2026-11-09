@@ -357,7 +357,7 @@ def happy_gh():
 
 
 def default_cfg(checks=("make test",)):
-    return Config(state_dir="/tmp/state", worktree_root="/tmp/wt-root",
+    return Config(state_dir="/tmp/state", worktree_root="/tmp/fake-wt",
                   repos=[RepoConfig(owner="o", name="r", base_branch="main",
                                     checks=list(checks))])
 
@@ -368,7 +368,23 @@ def run_job(job, gh, cfg=None, wt=None, agent=None):
     queue = FakeQueue(job)
     exe = JobExecutor(gh, queue, cfg or default_cfg(), agent, worktree_ops=wt)
     git_rec, gh_rec = RecordGit(), RecordGh()
+    def verify_fake_candidate(job, path):
+        # This state-machine suite fakes local verification deliberately.
+        # test_executor_receipts exercises the real Git/check boundary.
+        checks_pass, note = executor.evaluate_verification(exe._repo_checks(job), agent.result)
+        job.notes['verification'] = note
+        if checks_pass is False:
+            raise ValueError(note)
+        produced = wt.commit_all(path, 'fixture candidate')
+        tested = wt.current_sha(path)
+        job.notes.update(candidate_commit=produced, tested_base=tested,
+                         tested_commit=tested,
+                         changed_files=list(agent.result.changed_files),
+                         checks=list(agent.result.checks))
+        return checks_pass, note, tested
     with patch.object(executor, "_run_git", git_rec), \
+            patch.object(exe, '_verify_candidate', side_effect=verify_fake_candidate), \
+            patch.object(exe, '_confirm_candidate'), \
             patch.object(responder, "_run_gh", gh_rec):
         returned = exe.execute(job)
     return returned, queue, wt, agent, git_rec, gh_rec
@@ -404,7 +420,7 @@ class FixPrHappyPathTests(unittest.TestCase):
     def test_push_argv_is_explicit_and_never_forced(self):
         self.assertEqual(len(self.git.calls), 1)
         args, cwd, _ = self.git.calls[0]
-        self.assertEqual(args, ["push", "origin", f"HEAD:refs/heads/feature-x"])
+        self.assertEqual(args, ["push", "origin", f"{COMMIT}:refs/heads/feature-x"])
         self.assertNotIn("force", " ".join(args).lower())
         self.assertEqual(cwd, WT_PATH)
 
@@ -654,7 +670,7 @@ class ImplementIssueTests(unittest.TestCase):
         self.assertEqual(len(git.calls), 1)
         git_args = git.calls[0][0]
         self.assertEqual(git_args, ["push", "origin",
-                                    "HEAD:refs/heads/ghagent/issue-7"])
+                                    f"{COMMIT}:refs/heads/ghagent/issue-7"])
         self.assertNotIn("force", " ".join(git_args).lower())
         comments = gh_rec.pr_comment_calls()
         self.assertEqual(len(comments), 1)
@@ -688,12 +704,13 @@ class ForkedHeadTests(unittest.TestCase):
         job, queue, wt, agent, git, gh_rec = run_job(make_job(), gh)
         self.assertEqual(job.state, JobState.DONE, job.error)
         args = git.calls[0][0]
-        self.assertEqual(args[2], f"HEAD:refs/heads/gha/fix-{NUM}-deadbeef")
+        self.assertEqual(args[2], f"{COMMIT}:refs/heads/gha/fix-{NUM}-deadbeef")
         self.assertEqual(job.notes["companion_branch"], f"gha/fix-{NUM}-deadbeef")
         self.assertIn("fork", job.notes["pr_head_refusal"])
         summary = gh_rec.bodies[-1]
         self.assertIn("companion", summary)
         self.assertIn("was not fixed", summary)
+        self.assertEqual(job.resolved_thread_ids, [], 'A companion branch cannot resolve the original PR threads')
 
 
 class StatusTextTests(unittest.TestCase):

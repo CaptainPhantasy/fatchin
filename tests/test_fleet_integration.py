@@ -33,12 +33,20 @@ class FleetIntegrationTests(unittest.TestCase):
         self.assertEqual(deepseek.model.base_url, cfg.model.broker_base_url + '/proxy/deepseek')
         self.assertEqual(deepseek.model.broker_server_id, 'deepseek')
         self.assertEqual(deepseek.model.max_calls_per_job, 100)
-        self.assertGreater(deepseek.model.max_calls_per_day, 1_000_000)
+        self.assertEqual(deepseek.model.max_calls_per_day, 600)
         self.assertEqual(dataclasses.asdict(cfg), before)
         self.assertEqual(env, copied)
         self.assertNotIn('example-broker-value', json.dumps(provider_status(cfg, env)))
         with self.assertRaises(ValueError):
             model_config(cfg, env, 'substitute')
+
+    def test_daily_ceiling_can_be_lowered_but_never_removed(self):
+        from ghagent.fleet_providers import FLEET_DAILY_CALLS_MAX, fleet_daily_ceiling
+        self.assertEqual(fleet_daily_ceiling(600), 600)
+        self.assertEqual(fleet_daily_ceiling(50), 50)
+        self.assertEqual(fleet_daily_ceiling(0), FLEET_DAILY_CALLS_MAX)
+        self.assertEqual(fleet_daily_ceiling(10 ** 9), FLEET_DAILY_CALLS_MAX)
+        self.assertGreaterEqual(fleet_daily_ceiling(-5), 1)
 
     def test_repository_locks_allow_different_fleet_targets_but_hold_legacy_writes(self):
         with tempfile.TemporaryDirectory() as state:

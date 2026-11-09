@@ -58,10 +58,25 @@ jobs:
           python-version: "3.14"
           check-latest: true
       - name: Install the pinned build backend
-        run: python -m pip install "setuptools==84.2.1"
+        run: python -m pip install "setuptools==84.2.1" "build==1.6.1" "wheel==0.48.0"
       - name: Install the package without isolation
         run: python -m pip install --no-deps --no-build-isolation -e .
       - name: Confirm the entry points
         run: |
+          fatchin --help > /dev/null
+          fatchin-web --help > /dev/null
+      - name: Build the release artifacts
+        run: python -m build --no-isolation
+      - name: Verify the installed wheel outside the checkout
+        run: |
+          python -m pip install --force-reinstall --no-deps dist/fatchin-*.whl
+          python -I - <<'PYCODE'
+          import importlib.metadata
+          from ghagent import __version__, web, web_control
+          assert __version__ == web_control.VERSION == importlib.metadata.version("fatchin")
+          for asset in ("index.html", "app.js", "styles.css", "icon-512.png", "fonts/Inter-Regular.ttf"):
+              assert (web.WEB_ROOT / asset).is_file(), asset
+          assert (web.WEB_ROOT.parent / "docs/EXPLORE-AND-LEARN.md").is_file()
+          PYCODE
           fatchin --help > /dev/null
           fatchin-web --help > /dev/null

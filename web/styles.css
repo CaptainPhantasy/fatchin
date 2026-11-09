@@ -2143,8 +2143,9 @@ dialog.wide {
   padding: 0 20px;
 }
 .doorbell-row {
-  display: flex;
-  align-items: flex-start;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
   gap: 10px;
   padding: 14px 0;
   border-bottom: 1px solid #eef0f5;
@@ -2156,6 +2157,10 @@ dialog.wide {
 .doorbell-row p {
   color: var(--ink);
 }
+.doorbell-row > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
 .doorbell-row small {
   display: block;
   color: var(--muted);
@@ -2166,7 +2171,15 @@ dialog.wide {
   color: var(--accent);
 }
 .doorbell-meta {
-  margin-left: auto;
+  grid-column: 2;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.doorbell-meta .button {
+  max-width: 100%;
+  white-space: normal;
+  text-align: left;
 }
 .draft-actions {
   display: flex;
@@ -3156,3 +3169,47 @@ button { min-width: 44px; }
 /* Programmatic landmark focus must not frame the entire workspace. */
 #main:focus-visible { outline: 0; }
 .empty-state .button { min-height: 44px; }
+
+/* Recovery is part of each work item, with readable choices on small screens. */
+.recovery-card {
+  margin: 18px 0;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface, #fff);
+  overflow-wrap: anywhere;
+}
+.recovery-card h3 { margin: 0 0 9px; font-size: 16px; }
+.recovery-card p { margin: 9px 0; line-height: 1.6; }
+.recovery-card pre, .detail-section pre, #fleet-file-result pre {
+  max-height: 420px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.recovery-actions { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; margin-top: 12px; }
+.fleet-tabs { flex-wrap: wrap; }
+.toast:has(.recovery-actions) { flex-wrap: wrap; }
+.toast .recovery-actions { width: 100%; }
+.dialog-error p { margin: 0 0 10px; }
+.saved-lessons { margin-top: 14px; }
+@media (max-width: 720px) {
+  .recovery-card { padding: 14px; }
+  .recovery-actions > .button { white-space: normal; text-align: left; }
+  .watches-table .button { margin: 5px 5px 5px 0; white-space: normal; }
+}
+@media (min-width: 721px) {
+  .watches-table { table-layout: fixed; width: 100%; }
+  .watches-table th, .watches-table td { white-space: normal; overflow-wrap: anywhere; }
+  .watches-table th:nth-child(1) { width: 20%; }
+  .watches-table th:nth-child(2) { width: 15%; }
+  .watches-table th:nth-child(3) { width: 17%; }
+  .watches-table th:nth-child(4) { width: 32%; }
+  .watches-table th:nth-child(5) { width: 16%; }
+  .watches-table .button { max-width: 100%; white-space: normal; margin-bottom: 7px; }
+}
+.watches-table .cell-sub, .watches-table .field-hint { white-space: normal; overflow-wrap: anywhere; font-size: 12px; }
+@media (max-width: 720px) {
+  .watches-table td:nth-child(4) { display: block; }
+  .watches-table td:nth-child(4):before { display: block; margin-bottom: 7px; }
+}

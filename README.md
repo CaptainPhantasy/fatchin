@@ -7,7 +7,7 @@
 A push goes in. A reviewed, checked, corrected pull request comes out — with a
 second worker reviewing the correction, and you making the merge decision.
 
-FatChin runs on your machine, uses your model endpoint, and never merges. It is
+FatChin runs on your machine and uses your model endpoint. Its fleet never merges. It is
 standard-library Python, a vanilla-JS interface, and no runtime dependencies.
 
 ```text
@@ -25,8 +25,9 @@ agents are useful until one writes to `main`. FatChin takes the middle path:
   you grant, with per-repository concurrency and policy.
 - **Bring your own model.** Any OpenAI-compatible chat endpoint with tool
   calling. No vendor account, no per-seat fee.
-- **The human keeps the merge.** There is no merge code path. It cannot merge,
-  approve, or force-push.
+- **The human keeps the merge.** The fleet cannot merge or approve a pull
+  request. Separate high-stakes branch-sync tasks require your explicit review
+  and confirmation before they merge and push.
 - **Evidence, not vibes.** Checks run in a sandbox, findings must cite a line,
   and a correction is reviewed by a different worker slot.
 - **A dry run that writes nothing.** Every intended comment, pull request,
@@ -42,13 +43,13 @@ send, and sends nothing. Click the animation for the MP4.
 
 ![Dry-run terminal output: one finding, a recorded comment, zero GitHub writes](docs/screenshots/demo-terminal.png)
 
-![The offline suite: 912 tests, OK in 36 seconds](docs/screenshots/tests.png)
+![A recorded offline-suite run; current results are in CI](docs/screenshots/tests.png)
 
 ## Safety model
 
 | Boundary | What it means |
 | --- | --- |
-| No merge path | The fleet can mark a pull request ready; merging stays with you. |
+| Fleet merge gate | The fleet can mark a pull request ready; merging stays with you. Explicit branch-sync tasks ask separately. |
 | No force-push | A correction is an ordinary commit on a branch. |
 | Draft first | A pushed feature branch becomes a **draft** pull request; a draft cannot merge. |
 | Sandboxed commands | Checks and model-issued commands run in bubblewrap with no network, no account files, and read-only Git metadata. Missing bubblewrap is a refusal, not a fallback. |
@@ -69,6 +70,14 @@ exercise them.
 - No Node.js, npm, or build step. The optional browser test runners use a
   current Node; the worker and the Python suite never invoke it.
 - Optional: a systemd user session for the two supplied units.
+
+## Release 0.3.0
+
+This release adds guided recovery for stopped and failed work, explicit saved-folder
+choices for watches, retained drafts and publication evidence, and working setup
+handoffs. Repository saves preserve fleet-policy tables. Provider pacing, roles,
+publication safety and human merge decisions remain in place. See
+[release notes](docs/RELEASES.md).
 
 ## Quick start
 
@@ -112,10 +121,11 @@ bash scripts/demo-dry-run.sh owner/repository
 
 ### Expose it beyond loopback
 
-Supply an admin token. The server refuses to bind remotely without one:
+Set `FATCHIN_MESH_IP` to your machine’s mesh address, then supply an admin token.
+The release server refuses to bind beyond loopback without a token:
 
 ```sh
-fatchin-web --host 0.0.0.0 --port 18465 --token "$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
+fatchin-web --host "$FATCHIN_MESH_IP" --port 18465 --token "$(python3 -c 'import secrets;print(secrets.token_urlsafe(32))')"
 ```
 
 The browser asks for that token once and stores it in session storage. `/api/*`

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import dataclasses
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +10,7 @@ from unittest.mock import patch
 from ghagent import fleet_runner
 from ghagent.config_loader import ConfigError, fleet_table_problems, load_config
 from ghagent.fleet_discovery import _halted
-from ghagent.fleet_providers import model_config, provider_status
+from ghagent.fleet_providers import FLEET_DAILY_CALLS_MAX, model_config, provider_status
 from ghagent.fleet_store import FleetStore
 from ghagent.interfaces import Config, ModelConfig
 from ghagent.model_client import ModelClient
@@ -42,17 +41,22 @@ class ProviderIdTests(unittest.TestCase):
 
 
 class DailyCapTests(unittest.TestCase):
-    def test_unset_cap_keeps_continuous_fleet_behaviour(self):
+    def test_unset_cap_uses_bounded_model_default(self):
         for provider in ('glm', 'deepseek'):
             resolved, _ = model_config(glm_cfg(), BROKER, provider)
-            self.assertEqual(resolved.model.max_calls_per_day, sys.maxsize)
+            self.assertEqual(resolved.model.max_calls_per_day, 600)
 
     def test_configured_cap_applies_per_provider(self):
         cfg = glm_cfg(fleet_max_calls_per_day={'glm': 4000, 'deepseek': 3000})
         self.assertEqual(model_config(cfg, BROKER, 'glm')[0].model.max_calls_per_day, 4000)
         self.assertEqual(model_config(cfg, BROKER, 'deepseek')[0].model.max_calls_per_day, 3000)
         only = glm_cfg(fleet_max_calls_per_day={'deepseek': 50})
-        self.assertEqual(model_config(only, BROKER, 'glm')[0].model.max_calls_per_day, sys.maxsize)
+        self.assertEqual(model_config(only, BROKER, 'glm')[0].model.max_calls_per_day, 600)
+
+    def test_provider_override_cannot_remove_the_hard_ceiling(self):
+        cfg = glm_cfg(fleet_max_calls_per_day={'glm': 10 ** 9})
+        self.assertEqual(model_config(cfg, BROKER, 'glm')[0].model.max_calls_per_day,
+                         FLEET_DAILY_CALLS_MAX)
 
     def test_fleet_runner_passes_the_cap_to_the_provider_ledger(self):
         seen = {}
@@ -104,6 +108,49 @@ class RolePinningTests(unittest.TestCase):
         f = fleet(self.store, workers=2, deepseek_workers=0)
         self.store.upsert(f['id'], [candidate(1)])
         self.assertEqual(self.store.claim(1, self.ROLES)['kind'], 'review_pr')
+
+
+class RecoveryRoutingParityTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.store = FleetStore(Path(temp.name) / 'fleet-v1')
+        self.fleet = fleet(self.store, workers=2, deepseek_workers=2)
+
+    def test_role_routing_cannot_bypass_archive_or_restore_hold(self):
+        self.store.upsert(self.fleet['id'], [candidate(1)])
+        roles = {'review_pr': 'deepseek'}
+        item = self.store.claim(11, roles)
+        self.store.finish(item['id'], item['lease'], {'status': 'blocked', 'error': 'Check failed'})
+        self.store.control('archive', item_id=item['id'])
+        self.assertIsNone(self.store.claim(12, roles))
+        self.store.control('restore', item_id=item['id'])
+        self.assertIsNone(self.store.claim(12, roles))
+        self.store.control('retry', item_id=item['id'])
+        self.assertIsNone(self.store.claim(1, roles))
+        retry = self.store.claim(12, roles)
+        self.assertEqual((retry['id'], retry['provider']), (item['id'], 'deepseek'))
+        self.assertEqual(retry['attempts'], 2)
+
+    def test_overview_and_snapshot_share_archive_aware_merge_gate(self):
+        self.store.upsert(self.fleet['id'], [candidate(1)])
+        review = self.store.claim(1)
+        self.store.finish(review['id'], review['lease'], {'status': 'done',
+            'readiness': {'ready': True, 'head_sha': 'a' * 40}})
+        self.store.upsert(self.fleet['id'], [candidate(1, 'fix_comment', comment_id='finding', body='Fix this')],
+                          readiness={'owner/repo#1': {'ready': True, 'head_sha': 'a' * 40}})
+        finding = self.store.claim(2)
+        self.store.finish(finding['id'], finding['lease'], {'status': 'blocked', 'error': 'Needs attention'})
+        self.assertEqual(self.store.snapshot()['ready'], [])
+        overview = {row['id']: row for row in self.store.overview()['recent_tasks']}
+        self.assertFalse(overview[review['id']]['merge_ready'])
+        self.store.control('archive', item_id=finding['id'])
+        self.assertEqual([row['id'] for row in self.store.snapshot()['ready']], [review['id']])
+        overview = {row['id']: row for row in self.store.overview()['recent_tasks']}
+        self.assertTrue(overview[review['id']]['merge_ready'])
+        self.store.control('archive', item_id=review['id'])
+        self.assertEqual(self.store.snapshot()['ready'], [])
+        self.assertEqual(self.store.overview()['recent_tasks'], [])
 
 
 class PacingTests(unittest.TestCase):

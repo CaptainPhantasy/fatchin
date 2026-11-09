@@ -16,6 +16,7 @@ the chosen target.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 
 from .types import TaskType
@@ -80,6 +81,32 @@ def _check_branch_names(values: dict, error=_reject) -> None:
                     "different branch that should receive it.")
 
 
+def prepare_plan(context: dict, gh, job) -> None:
+    """Save the exact two advertised branch versions before a plan is drafted."""
+    ensure_not_stopped(context)
+    values = _values(context, job)
+    _check_branch_names(values, PreWriteRefusal)
+    source, target = _name(values, 'source'), _name(values, 'target')
+    job_id = str(job.job_id)
+    if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', job_id):
+        raise PreWriteRefusal('This task has no valid plan identity. Start a new task.')
+    worktree = _worktree(context, job)
+    # Shared branch refs can move when another task refreshes the bare cache.
+    # Keep the fetched objects reachable under job-specific, non-branch refs.
+    source_ref = f'refs/fatchin-plans/{job_id}/source'
+    target_ref = f'refs/fatchin-plans/{job_id}/target'
+    rc, out, err = _run_git(['fetch', '--no-tags', REMOTE,
+                            f'+refs/heads/{source}:{source_ref}',
+                            f'+refs/heads/{target}:{target_ref}'], cwd=worktree)
+    if rc:
+        raise _failed('fetch of the branch plan', out, err,
+                      'No plan was prepared and nothing was pushed.')
+    planned = {f'refs/heads/{source}': commit_id(_run_git, worktree, source_ref),
+               f'refs/heads/{target}': commit_id(_run_git, worktree, target_ref)}
+    job.notes['planned_refs'] = planned
+    context['planned_refs'] = dict(planned)
+
+
 def build_instruction(context: dict) -> str:
     """Tell the agent what to compare, what to explain, and where the plan goes."""
     context = context or {}
@@ -87,6 +114,9 @@ def build_instruction(context: dict) -> str:
     repo = str(context.get("repo") or "this repository")
     source = _name(values, "source") or "the source branch"
     target = _name(values, "target") or "the target branch"
+    planned = context.get('planned_refs') or {}
+    source_version = planned.get(f'refs/heads/{source}', f'origin/{source}')
+    target_version = planned.get(f'refs/heads/{target}', f'origin/{target}')
     return (
         f"Task: bring the branch “{target}” of {repo} up to date with the branch "
         f"“{source}”, and explain to the person exactly what that will move "
@@ -94,8 +124,8 @@ def build_instruction(context: dict) -> str:
         "Look before you write. Read-only git commands are fine here (git log, "
         "git diff, git show, git merge-base); do not fetch, merge, checkout, "
         "commit, or push anything yourself. Compare the two branches with "
-        f"`git log --oneline origin/{source}..origin/{target}` and "
-        f"`git log --oneline origin/{target}..origin/{source}` when those "
+        f"`git log --oneline {source_version}..{target_version}` and "
+        f"`git log --oneline {target_version}..{source_version}` using the "
         "remote branches are present in the checkout; if one is missing, say so "
         "in one line instead of guessing.\n\n"
         "Your summary is what the person reads first, so it must answer three "
@@ -179,15 +209,12 @@ def apply(context: dict, gh, job) -> dict:
     source, target = _name(values, "source"), _name(values, "target")
     worktree = _worktree(context, job)
     repository_policy(context, job)
-    # The plan was written against this local view. Fetch into explicit remote
-    # refs (also works with a bare-clone cache), then refuse a changed source.
-    rc, out, _ = _run_git(['rev-parse', '--verify', f'{REMOTE}/{source}'], cwd=worktree)
-    if rc:
-        rc, out, _ = _run_git(['rev-parse', '--verify', f'refs/heads/{source}'], cwd=worktree)
-    if rc or not out.strip():
-        raise PreWriteRefusal('The source branch in this plan is unknown. Nothing was pushed; '
-                              'run the task again to inspect the current branch.')
-    planned_source = out.strip()
+    planned = job.notes.get('planned_refs') or {}
+    if not isinstance(planned, dict) or any(
+            not re.fullmatch(r'[0-9a-f]{40,64}', str(planned.get(f'refs/heads/{branch}', '')))
+            for branch in (source, target)):
+        raise PreWriteRefusal('This plan has no saved source and target versions. '
+                              'Nothing was pushed; start a new task to review both branches.')
 
     rc, out, err = _run_git(["fetch", REMOTE,
                             f'+refs/heads/{source}:refs/remotes/{REMOTE}/{source}',
@@ -198,8 +225,9 @@ def apply(context: dict, gh, job) -> dict:
 
     source_sha = commit_id(_run_git, worktree, f'{REMOTE}/{source}')
     target_sha = commit_id(_run_git, worktree, f'{REMOTE}/{target}')
-    if planned_source != source_sha:
-        raise PreWriteRefusal('The source branch moved since the plan was written. '
+    if (planned[f'refs/heads/{source}'] != source_sha or
+            planned[f'refs/heads/{target}'] != target_sha):
+        raise PreWriteRefusal('The source or target branch moved since the plan was written. '
                               'Nothing was pushed; run the task again to review the new commits.')
     rc, out, err = _run_git(["checkout", "--detach", target_sha],
                             cwd=worktree)

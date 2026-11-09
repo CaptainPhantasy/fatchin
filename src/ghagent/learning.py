@@ -267,6 +267,85 @@ class LearningEngine:
             self._cleanup(state)
             return self._public(state)
 
+    def list_sessions(self, account):
+        """Find saved work without relying on one browser's local storage.
+
+        An unreadable record remains an explicit problem in the list. It is
+        never replaced, treated as an empty lesson, or silently skipped.
+        """
+        if not isinstance(account, str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', account):
+            raise LearningError('Choose your member account to find your saved lessons.')
+        result = []
+        try:
+            paths = [path for path in self.state_dir.iterdir() if path.suffix == '.json']
+        except OSError as exc:
+            raise LearningError('Saved lessons could not be listed. Existing work is preserved. '
+                                'Try again or ask the maintainer to restore access.', 503) from exc
+        for path in paths:
+            if path.name == 'creation-requests.json':
+                continue
+            try:
+                sid = _uuid(path.stem)
+                if path.is_symlink():
+                    raise LearningError('This saved lesson uses a symbolic link and cannot be opened safely.', 503)
+                store = self._store(sid)
+                with store.lock():
+                    state = self._load(store)
+                if state['id'] != sid:
+                    raise LearningError('This saved lesson has a mismatched identifier; its record is preserved.', 503)
+                if (not isinstance(state['account'], str) or not isinstance(state['status'], str)
+                        or any(state.get(key) is not None and not isinstance(state[key], str)
+                               for key in ('created_at', 'updated_at'))):
+                    raise LearningError('This saved lesson has unreadable details; its record is preserved.', 503)
+                if state['account'] != account:
+                    continue
+                result.append({key: copy.deepcopy(state.get(key)) for key in (
+                    'id', 'account', 'status', 'mode', 'lesson', 'repo', 'output_dir',
+                    'created_at', 'updated_at', 'revision', 'error')})
+                result[-1]['busy'] = bool(state.get('operation'))
+                result[-1]['readable'] = True
+            except (LearningError, RuntimeError, OSError, ValueError, TypeError) as exc:
+                # Ownership cannot be established for a damaged record. Show
+                # only its identifier and the recovery instruction, not content.
+                result.append({'id': path.stem, 'account': None, 'status': 'unavailable',
+                               'readable': False, 'error': _redact(str(exc)),
+                               'next_step': 'The original record is preserved. Ask the maintainer '
+                                            'to restore this lesson from its backup; other lessons still open.'})
+        return sorted(result, key=lambda row: row.get('updated_at') or '', reverse=True)
+
+    def change_destination(self, sid, account, output_dir, expected_revision):
+        """Rebind an export after the HTTP layer validates the member folder.
+
+        This changes no lesson content and never exports or repeats an action.
+        """
+        if (not isinstance(output_dir, str) or not Path(output_dir).is_absolute()
+                or not Path(output_dir).is_dir()):
+            raise LearningError('Choose an existing results folder in your account before saving it.')
+        destination = Path(output_dir)
+        if any(path.is_symlink() for path in (destination, *destination.parents)):
+            raise LearningError('Choose a regular folder inside your account, without symbolic links.')
+        if not os.access(destination, os.W_OK | os.X_OK):
+            raise LearningError('This folder cannot receive your transcript. Choose another folder or ask '
+                                'the maintainer to restore access.')
+        store = self._store(sid)
+        with store.lock():
+            state = self._load(store)
+            if account != state['account']:
+                raise LearningError('Keep this lesson in its original member account. Choose that account’s folder.', 409)
+            if type(expected_revision) is not int or expected_revision != state['revision']:
+                raise LearningError('This lesson changed. Reload it before choosing its results folder.', 409)
+            if state.get('operation'):
+                raise LearningError('This lesson is still working. Reload it when that action finishes, '
+                                    'then choose the results folder.', 409)
+            if state['output_dir'] != output_dir:
+                state.setdefault('destination_history', []).append({
+                    'at': now(), 'previous_output_dir': state['output_dir'],
+                    'output_dir': output_dir, 'source': 'member-choice'})
+                state['output_dir'] = output_dir
+                state['error'] = ''
+                self._save(store, state)
+            return self._public(state)
+
     def _prepare(self, state):
         steps = _lesson_steps(state['lesson'])
         if state['step_index'] >= len(steps):

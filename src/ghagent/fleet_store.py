@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .control_store import atomic_json
+from .recovery import failed_checks, fleet_recovery, safe_evidence
 
 MAX_WORKERS = 20
 MAX_PER_PROVIDER = 10
@@ -69,9 +70,11 @@ class FleetStore:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
     @staticmethod
-    def _event(data, message, item=None, slot=None):
-        data['events'].append({'at': now(), 'message': message, 'item_id': item, 'slot': slot})
-        data['events'] = data['events'][-500:]
+    def _event(data, message, item=None, slot=None, fleet_id=None):
+        saved = data['items'].get(item) or {}
+        event = {'at': now(), 'message': message, 'item_id': item, 'slot': slot,
+                 'fleet_id': fleet_id or saved.get('fleet_id'), 'repo': saved.get('repo')}
+        data['events'].append(event)
 
     def internal(self):
         with self._locked() as data:
@@ -80,11 +83,13 @@ class FleetStore:
     def overview(self):
         """Bounded shared projection for every workspace screen, without task bodies."""
         with self._locked() as data:
-            fleets = [f for f in data['fleets'].values() if f['status'] != 'stopped']
+            fleets = list(data['fleets'].values())
             ids = {f['id'] for f in fleets}
             repositories = {}
             configured, active = {'glm': 0, 'deepseek': 0}, {'glm': 0, 'deepseek': 0}
             for fleet in fleets:
+                if fleet['status'] == 'stopped':
+                    continue
                 configured['glm'] += fleet.get('workers', 0)
                 configured['deepseek'] += fleet.get('deepseek_workers', 0)
                 for repo in fleet.get('repositories', []):
@@ -94,7 +99,8 @@ class FleetStore:
                         repositories[name] = {'repo': name, 'status': status,
                             'private': repo.get('private'), 'output_dir': fleet['output_dir'],
                             'account': fleet['account'], 'fleet_id': fleet['id']}
-            items = [i for i in data['items'].values() if i['fleet_id'] in ids]
+            all_items = [i for i in data['items'].values() if i['fleet_id'] in ids]
+            items = [i for i in all_items if not i.get('archived_at')]
             counts, by_repo = {}, {}
             for item in items:
                 status = item['status']
@@ -111,21 +117,23 @@ class FleetStore:
             items.sort(key=lambda i: i.get('updated_at') or i.get('created_at', ''), reverse=True)
             items.sort(key=lambda i: {'running': 0, 'blocked': 1, 'retrying': 2, 'done': 3}.get(i['status'], 4))
             open_comments = self._open_fix_comments(data['items'].values())
-            public = []
-            for item in items[:60]:
-                row = {k: copy.deepcopy(item[k]) for k in ('id', 'repo', 'kind', 'number', 'title',
-                    'url', 'status', 'stage', 'provider', 'slot', 'error', 'updated_at') if k in item}
-                # Same gate as snapshot()['ready']. finish() stores a ready review as done.
-                row['merge_ready'] = self._merge_ready(item, open_comments)
-                public.append(row)
+            public = [{k: copy.deepcopy(i[k]) for k in ('id', 'repo', 'kind', 'number', 'title',
+                'url', 'status', 'stage', 'provider', 'slot', 'error', 'updated_at', 'fleet_id') if k in i}
+                | {'merge_ready': self._merge_ready(i, open_comments),
+                   'fleet_status': data['fleets'][i['fleet_id']]['status'],
+                   'recovery': fleet_recovery(i, data['fleets'][i['fleet_id']], data)}
+                for i in items[:60]]
             return {'fleets': [{k: copy.deepcopy(f[k]) for k in ('id', 'account', 'status', 'scope',
-                        'workers', 'deepseek_workers', 'output_dir', 'last_scan_at', 'error') if k in f}
+                        'workers', 'deepseek_workers', 'output_dir', 'last_scan_at', 'error',
+                        'dry_run', 'dry_run_completed_at', 'calls_used', 'max_calls_total') if k in f}
                     for f in fleets],
                 'repositories': sorted(repositories.values(), key=lambda r: r['repo'].casefold()),
                 'repository_count': len(repositories),
                 'configured_agents': {p: min(MAX_PER_PROVIDER, n) for p, n in configured.items()},
                 'active_agents': active, 'max_workers_per_repository': MAX_PER_REPOSITORY,
-                'task_counts': counts, 'recent_tasks': public,
+                'task_counts': counts, 'recent_tasks': safe_evidence(public),
+                'history_count': len(all_items), 'archived_count': len(all_items) - len(items),
+                'unresolved_count': sum(i['status'] in {'blocked', 'failed', 'retrying'} or (i['status'] == 'done' and failed_checks(i)) for i in items),
                 'events': copy.deepcopy(data['events'][-30:]),
                 'supervisor': {k: copy.deepcopy(data['supervisor'][k]) for k in
                     ('status', 'heartbeat_at', 'last_scan_at', 'discovery_error', 'discovery_failed_repos')
@@ -142,7 +150,7 @@ class FleetStore:
 
     def _reconcile_scope(self, data, fleet):
         for item in data['items'].values():
-            if item['fleet_id'] != fleet['id']:
+            if item['fleet_id'] != fleet['id'] or item.get('archived_at') or item.get('restore_hold'):
                 continue
             if not self._in_scope(fleet, item):
                 item['scope_excluded'] = True
@@ -196,6 +204,10 @@ class FleetStore:
                      'deepseek_workers': value.get('deepseek_workers', 0), 'repos': value.get('repos', []), 'status': 'running', 'created_at': (existing or {}).get('created_at', now()),
                      'updated_at': now(), 'error': '', 'max_calls_total': budget,
                      'dry_run': dry_run, 'calls_used': 0, 'drained_at': '', 'empty_since': ''}
+            if existing:
+                fleet['configuration_history'] = copy.deepcopy(existing.get('configuration_history') or [])
+                fleet['configuration_history'].append({'at': now(), 'previous_configuration':
+                    {key: copy.deepcopy(val) for key, val in existing.items() if key != 'configuration_history'}})
             if existing and 'repositories' in existing:
                 fleet['repositories'] = copy.deepcopy(existing['repositories'])
             data['fleets'][fleet_id] = fleet
@@ -204,7 +216,7 @@ class FleetStore:
                                       (('glm', fleet['workers']), ('deepseek', fleet['deepseek_workers'])) if count > 0]
                 for item in data['items'].values():
                     previous_provider = item.get('provider')
-                    if (item['fleet_id'] != fleet_id or item['status'] not in PENDING | {'blocked'}
+                    if (item.get('archived_at') or item.get('restore_hold') or item['fleet_id'] != fleet_id or item['status'] not in PENDING | {'blocked'}
                             or not previous_provider or previous_provider in selected_providers):
                         continue
                     replacement = selected_providers[0]
@@ -218,7 +230,7 @@ class FleetStore:
                                             'from': previous_provider, 'to': replacement})
                     self._event(data, 'Fleet settings moved the next fresh task from ' + previous_provider + ' to ' + replacement + '.', item['id'])
             self._reconcile_scope(data, fleet)
-            self._event(data, f"Fleet started for {value['account']}.")
+            self._event(data, f"Fleet started for {value['account']}.", fleet_id=fleet_id)
             return copy.deepcopy(fleet)
 
     def verification_changed(self, repo):
@@ -237,7 +249,7 @@ class FleetStore:
                 correction = item.get('correction_pr') or {}
                 exhausted_repairs = (item['kind'] == 'fix_comment' and item.get('phase') != 'resolve_thread'
                                      and int(correction.get('repair_round') or 0) >= 3)
-                if (source != normalized or item['status'] != 'blocked' or exhausted_repairs
+                if (item.get('archived_at') or item.get('restore_hold') or source != normalized or item['status'] != 'blocked' or exhausted_repairs
                         or item.get('auto_recheck') is False or (item.get('result') or {}).get('auto_recheck') is False
                         or not self._in_scope(data['fleets'][item['fleet_id']], item)):
                     continue
@@ -250,35 +262,90 @@ class FleetStore:
             data['supervisor']['refresh_requested'] = datetime.now(timezone.utc).isoformat()
         return {'repo': str(repo), 'requeued': requeued, 'count': len(requeued)}
 
-    def control(self, action, fleet_id='', item_id=''):
+    def control(self, action, fleet_id='', item_id='', *, additional_calls=None, reason=''):
+        """Explicit local controls retain results and never replay a GitHub write."""
         with self._locked(True) as data:
-            if action == 'retry':
-                item = data['items'].get(item_id)
-                if not item or item['status'] not in {'blocked', 'dismissed'}:
-                    raise ValueError('This item is not waiting for a retry.')
-                if not self._in_scope(data['fleets'][item['fleet_id']], item):
-                    raise ValueError('This repository is outside the current writable scope. Restore its scope and access before retrying.')
-                # Explicit retry preserves total attempts and starts a new bounded allowance.
-                item['retry_allowance'] = item.get('attempts', 0) + MAX_ATTEMPTS
-                item['fault_allowance'] = item.get('fault_attempts', 0) + MAX_ATTEMPTS
-                item.update(status='queued', error='', eligible_at=now(), updated_at=now())
-                self._event(data, 'Retry requested; previous attempts and write receipts retained.', item_id)
+            item = data['items'].get(item_id) if item_id else None
+            if item and fleet_id and item['fleet_id'] != fleet_id:
+                raise ValueError('This item belongs to a different saved fleet. Open its own fleet before changing it.')
+            if item:
+                fleet_id = item['fleet_id']
+            fleet = data['fleets'].get(fleet_id)
+            if action in {'archive', 'restore', 'retry'}:
+                if not item:
+                    raise ValueError('This work item was not found. Refresh the list and choose it again.')
+                if action == 'archive':
+                    if item['status'] not in {'blocked', 'failed', 'done', 'dismissed'}:
+                        raise ValueError('Let this item finish or stop its fleet before archiving it. Its saved work is kept.')
+                    if not item.get('archived_at'):
+                        note = str(reason or 'Moved to history by the user.').strip()[:1000]
+                        item.update(archived_at=now(), archive_reason=note)
+                        item.setdefault('history', []).append({'at': now(), 'event': 'archived', 'reason': note, 'status': item['status']})
+                        self._event(data, 'Item archived. Its result and published-change records are kept.', item_id)
+                elif action == 'restore':
+                    if not item.get('archived_at'):
+                        raise ValueError('This item is already in the working list. Open its details to see the next step.')
+                    item.setdefault('archive_history', []).append({'archived_at': item.pop('archived_at'), 'reason': item.get('archive_reason'), 'restored_at': now()})
+                    item.update(restore_hold=True, restored_at=now())
+                    item.setdefault('history', []).append({'at': now(), 'event': 'restored', 'message': 'Restored for review; no new attempt was started.'})
+                    self._event(data, 'Item restored for review. Choose Retry explicitly when ready; restoring does not start work.', item_id)
+                else:
+                    eligible = item['status'] in {'blocked', 'failed', 'dismissed'} or (item['status'] == 'done' and failed_checks(item))
+                    if item.get('archived_at'):
+                        raise ValueError('Restore this item from history before retrying it. Restoring keeps all its evidence.')
+                    if not eligible:
+                        raise ValueError('This item does not need a retry. Open its saved result to see what happened.')
+                    if not self._in_scope(fleet, item):
+                        raise ValueError('This repository is outside the current writable scope. Review the fleet’s project selection and GitHub access, or archive the old item.')
+                    if fleet['status'] != 'running':
+                        raise ValueError('This fleet is stopped or paused. Resume the fleet first, then retry this item. No new attempt was queued.')
+                    if fleet.get('max_calls_total') and int(fleet.get('calls_used') or 0) >= int(fleet['max_calls_total']):
+                        raise ValueError('The authorized model-call budget is exhausted. Authorize additional calls before retrying, or leave this work saved.')
+                    item.setdefault('history', []).append({'at': now(), 'event': 'retry-requested',
+                        'previous_status': item['status'], 'previous_error': item.get('error', ''),
+                        'previous_result': copy.deepcopy(item.get('result') or {})})
+                    item.pop('restore_hold', None)
+                    item.pop('scope_excluded', None)
+                    item['retry_allowance'] = item.get('attempts', 0) + MAX_ATTEMPTS
+                    item['fault_allowance'] = item.get('fault_attempts', 0) + MAX_ATTEMPTS
+                    item.update(status='queued', error='', eligible_at=now(), updated_at=now())
+                    self._event(data, 'Retry requested; previous attempts, results and write receipts retained.', item_id)
             elif action == 'refresh':
                 data['supervisor']['refresh_requested'] = now()
             else:
-                fleet = data['fleets'].get(fleet_id)
                 if not fleet:
-                    raise ValueError('Fleet not found.')
-                if action not in {'pause', 'resume', 'stop'}:
-                    raise ValueError('Unknown fleet action.')
-                fleet['status'] = {'pause': 'paused', 'resume': 'running', 'stop': 'stopped'}[action]
-                fleet['updated_at'] = now()
-                if action == 'stop':
-                    for item in data['items'].values():
-                        if item['fleet_id'] == fleet_id and item['status'] == 'running':
-                            item['fenced'] = True
-                self._event(data, f"Fleet {fleet['status']}.")
-            return {'ok': True, 'action': action}
+                    raise ValueError('Choose a saved fleet before changing its state.')
+                if action == 'authorize_budget':
+                    if type(additional_calls) is not int or not 1 <= additional_calls <= 10000:
+                        raise ValueError('Choose between 1 and 10,000 additional model calls. This is the most the fleet may use beyond its saved budget.')
+                    used = int(fleet.get('calls_used') or 0)
+                    previous = int(fleet.get('max_calls_total') or 0)
+                    if not previous:
+                        raise ValueError('This fleet has no exhausted run budget. Review its settings rather than authorizing extra calls.')
+                    fleet['max_calls_total'] = max(previous, used) + additional_calls
+                    fleet.setdefault('budget_history', []).append({'at': now(), 'previous_budget': previous,
+                        'calls_used': used, 'additional_calls': additional_calls, 'new_budget': fleet['max_calls_total']})
+                    if 'budget' in str(fleet.get('error') or '').lower():
+                        fleet['error'] = ''
+                    fleet['status'] = 'running'
+                    fleet['updated_at'] = now()
+                    self._event(data, f"User authorized {additional_calls} additional model calls; {used} previous calls remain recorded.", fleet_id=fleet_id)
+                else:
+                    if action not in {'pause', 'resume', 'stop'}:
+                        raise ValueError('Choose Pause, Resume, Stop, Retry, Archive, Restore or authorize additional calls.')
+                    if action == 'resume' and fleet.get('max_calls_total') and int(fleet.get('calls_used') or 0) >= int(fleet['max_calls_total']):
+                        raise ValueError('The authorized model-call budget is exhausted. Choose Authorize additional calls and set an amount, or leave the fleet paused. Resume alone cannot spend more.')
+                    fleet['status'] = {'pause': 'paused', 'resume': 'running', 'stop': 'stopped'}[action]
+                    fleet['updated_at'] = now()
+                    if action == 'stop':
+                        for saved in data['items'].values():
+                            if saved['fleet_id'] == fleet_id and saved['status'] == 'running':
+                                saved['fenced'] = True
+                    self._event(data, f"Fleet {fleet['status']}.", fleet_id=fleet_id)
+            return {'ok': True, 'action': action, 'fleet_id': fleet_id,
+                    'fleet_status': fleet.get('status') if fleet else None,
+                    'message': {'archive': 'Item saved in history. Its original evidence is kept.',
+                                'restore': 'Item restored for review. No new work was started.'}.get(action, 'Your choice was saved.')}
 
     @staticmethod
     def _key(candidate):
@@ -299,6 +366,8 @@ class FleetStore:
         item_id = 'item_' + identity(key)
         item = data['items'].get(item_id)
         if item:
+            if item.get('archived_at') or item.get('restore_hold'):
+                return item
             # The same blob can move to a newer branch head before its first review.
             # Keep one work item but read it from the newest pinned snapshot.
             if (item['kind'] == 'review_code' and item['status'] not in {'running', 'done'}
@@ -353,7 +422,7 @@ class FleetStore:
             affected = metadata.get('scanned_repos')
             failed = set(metadata.get('failed_repos', []))
             for item in data['items'].values():
-                if item['fleet_id'] != fleet_id:
+                if item['fleet_id'] != fleet_id or item.get('archived_at') or item.get('restore_hold'):
                     continue
                 if item['kind'] == 'review_pr' and (affected is None or item['repo'] in affected or item['repo'] in failed):
                     key = f"{item['repo']}#{item['number']}"
@@ -374,7 +443,7 @@ class FleetStore:
             promoted = set(metadata.get('promoted_branches') or [])
             conditions = metadata.get('repository_conditions', {})
             for item in data['items'].values():
-                if item['fleet_id'] != fleet_id:
+                if item['fleet_id'] != fleet_id or item.get('archived_at') or item.get('restore_hold'):
                     continue
                 if (item['kind'] == 'review_code' and item['status'] in PENDING
                         and not item.get('paths')):
@@ -490,7 +559,7 @@ class FleetStore:
             if not fleet:
                 return None
             busy = any(item['fleet_id'] == fleet_id
-                       and item['status'] in {'running', 'queued', 'retrying'}
+                       and not item.get('archived_at') and item['status'] in {'running', 'queued', 'retrying'}
                        for item in data['items'].values())
             if busy:
                 fleet.pop('empty_since', None)
@@ -512,23 +581,27 @@ class FleetStore:
                     status: sum(1 for i in data['items'].values()
                                 if i['fleet_id'] == fleet_id and i['status'] == status)
                     for status in ('done', 'blocked', 'dismissed')}
+                if fleet.get('dry_run') and not fleet.get('dry_run_completed_at'):
+                    # The rehearsal is finished. Record it so the next dispatch
+                    # is not silently another rehearsal.
+                    fleet['dry_run_completed_at'] = now()
+                    self._event(data, 'Dry run finished. The next dispatch can send real '
+                                      'work; nothing was sent during this one.')
                 self._event(data, 'Fleet caught up: no queued or running work remains.')
             return fleet.get('drained_at')
 
     @staticmethod
     def _prune(data, fleet_id, keep=2000):
-        terminal = [i for i in data['items'].values()
-                    if i['fleet_id'] == fleet_id and i['status'] in {'done', 'dismissed'}]
-        if len(terminal) <= keep:
-            return
-        terminal.sort(key=lambda i: i.get('updated_at') or '')
-        for item in terminal[:len(terminal) - keep]:
-            data['items'].pop(item['id'], None)
+        # History is a lasting asset. Working-list filters provide a short view;
+        # they must never delete a person's saved results behind that view.
+        return None
 
     def claim(self, slot, roles=None):
         if type(slot) is not int or not 1 <= slot <= MAX_WORKERS:
             raise ValueError('Invalid agent slot.')
-        with self._locked(True) as data:
+        # Selection still holds the exclusive lock. Persist only an actual
+        # claim; idle pool checks must not rewrite the retained task history.
+        with self._locked() as data:
             provider = 'glm' if slot <= 10 else 'deepseek'
             active = [i for i in data['items'].values() if i['status'] == 'running']
             if len(active) >= MAX_WORKERS or any(i['slot'] == slot for i in active):
@@ -542,15 +615,17 @@ class FleetStore:
                 for repo in self._repositories(running):
                     repository_load[repo] = repository_load.get(repo, 0) + 1
             candidates = []
+            changed = False
             for item in data['items'].values():
                 fleet = data['fleets'][item['fleet_id']]
                 if fleet.get('max_calls_total') and int(fleet.get('calls_used') or 0) >= int(fleet['max_calls_total']):
                     if fleet['status'] == 'running':
                         fleet['status'] = 'paused'
-                        fleet['error'] = 'The run budget is exhausted. Resume the fleet to continue.'
+                        fleet['error'] = 'The authorized model-call budget is exhausted. Authorize additional calls to continue, or leave the fleet paused.'
                         self._event(data, 'Run budget reached; no new work was assigned.')
+                        changed = True
                     continue
-                if (item['status'] not in PENDING or fleet['status'] != 'running'
+                if (item.get('archived_at') or item.get('restore_hold') or item['status'] not in PENDING or fleet['status'] != 'running'
                         or not self._in_scope(fleet, item)
                         or item.get('eligible_at', '') > now() or fleet.get('error')
                         or (item.get('provider') and item['provider'] != provider)
@@ -566,6 +641,8 @@ class FleetStore:
             candidates.sort(key=lambda i: (i.get('created_at', ''), i['id']), reverse=True)
             candidates.sort(key=lambda i: i['priority'])
             if not candidates:
+                if changed:
+                    atomic_json(self.path, data)
                 return None
             item = candidates[0]
             item.update(status='running', provider=provider, lease=secrets.token_hex(24), fenced=False, slot=slot,
@@ -576,6 +653,7 @@ class FleetStore:
                 'status': 'running', 'provider': provider, 'stage': 'Starting', 'started_at': now(), 'heartbeat_at': now(),
                 'restarts': max(0, item['attempts'] - 1)}
             self._event(data, f"Agent {slot} started {item['kind'].replace('_', ' ')}.", item['id'], slot)
+            atomic_json(self.path, data)
             return {**copy.deepcopy(item), 'fleet': copy.deepcopy(data['fleets'][item['fleet_id']])}
 
     def fence(self, item_id, lease, reason='Agent reset requested.'):
@@ -646,6 +724,9 @@ class FleetStore:
             item = data['items'].get(item_id)
             if not item or item.get('lease') != lease or item['status'] != 'running':
                 raise FleetStateError('The agent lease is no longer current.')
+            if item.get('result'):
+                item.setdefault('history', []).append({'at': now(), 'event': 'previous-attempt-result',
+                    'result': copy.deepcopy(item['result']), 'error': item.get('error', '')})
             item['result'] = copy.deepcopy(result)
             fleet = data['fleets'].get(item['fleet_id']) or {}
             try:
@@ -694,7 +775,7 @@ class FleetStore:
                         'created_at': now(), 'correction_pr': copy.deepcopy(correction),
                         'author_slot': item['slot']})
                 for review in data['items'].values():
-                    if (review['kind'] == 'review_pr' and review['repo'] == item['fix_pr'].get('repo')
+                    if (not review.get('archived_at') and review['kind'] == 'review_pr' and review['repo'] == item['fix_pr'].get('repo')
                             and review['number'] == item['fix_pr'].get('number')):
                         review['correction_pr'] = copy.deepcopy(item['fix_pr'])
                         review['author_slot'] = item['slot']
@@ -769,13 +850,13 @@ class FleetStore:
 
     @staticmethod
     def _open_fix_comments(items):
-        return [i for i in items if i.get('kind') == 'fix_comment' and not i.get('resolved_at') and i.get('status') != 'dismissed']
+        return [i for i in items if not i.get('archived_at') and i.get('kind') == 'fix_comment' and not i.get('resolved_at') and i.get('status') != 'dismissed']
 
     @staticmethod
     def _merge_ready(item, open_comments):
         """Authoritative human merge gate. A finished review is not enough."""
         readiness = item.get('readiness') or {}
-        return (item.get('kind') == 'review_pr' and item.get('status') == 'done'
+        return (not item.get('archived_at') and item.get('kind') == 'review_pr' and item.get('status') == 'done'
                 and bool(readiness.get('ready'))
                 and readiness.get('head_sha') == item.get('head_sha')
                 and not any(c.get('repo') == item.get('repo') and c.get('number') == item.get('number')
@@ -786,10 +867,16 @@ class FleetStore:
         items = []
         for item in data['items'].values():
             public = {k: v for k, v in item.items() if k not in {'lease', 'process', 'fenced', 'mutation_intents'}}
-            public['operations'] = [{'id': op['id'], 'kind': op['kind'], 'state': op['state']} for op in item.get('mutation_intents', [])]
-            items.append(public)
+            public['recovery'] = fleet_recovery(item, data['fleets'].get(item['fleet_id']) or {}, data)
+            public['fleet_status'] = (data['fleets'].get(item['fleet_id']) or {}).get('status')
+            public['operations'] = [safe_evidence({key: copy.deepcopy(op[key]) for key in
+                ('id', 'kind', 'state', 'payload', 'result', 'created_at', 'confirmed_at') if key in op})
+                for op in item.get('mutation_intents', [])]
+            items.append(safe_evidence(public))
         open_comments = self._open_fix_comments(items)
         ready = [item for item in items if self._merge_ready(item, open_comments)]
         return {'version': 1, 'max_workers': MAX_WORKERS, 'max_workers_per_provider': MAX_PER_PROVIDER, 'fleets': list(data['fleets'].values()),
                 'workers': list(data['workers'].values()), 'items': items, 'ready': ready,
+                'archived': [i for i in items if i.get('archived_at')], 'history_count': len(items),
+                'unresolved_count': sum(not i.get('archived_at') and (i['status'] in {'blocked', 'failed', 'retrying'} or (i['status'] == 'done' and failed_checks(i))) for i in items),
                 'comments': open_comments, 'rate_limits': data.get('rate_limits', {}), 'events': data['events'], 'supervisor': data['supervisor']}
