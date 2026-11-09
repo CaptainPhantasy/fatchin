@@ -28,8 +28,8 @@ python3 -m pip install --user -e "$ROOT"
 mkdir -p "$CONFIG_DIR" "$SYSTEMD_DIR"
 
 if [ ! -e "$CONFIG_DIR/config.toml" ]; then
-  python3 -m ghagent.cli init-config --path "$CONFIG_DIR/config.toml" 2>/dev/null || \
-    fatchin init-config --path "$CONFIG_DIR/config.toml"
+  python3 -m ghagent.cli init-config "$CONFIG_DIR/config.toml" 2>/dev/null || \
+    fatchin init-config "$CONFIG_DIR/config.toml"
 else
   echo "config already present, left untouched: $CONFIG_DIR/config.toml"
 fi

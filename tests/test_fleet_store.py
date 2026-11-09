@@ -92,6 +92,9 @@ class FleetStoreTests(unittest.TestCase):
         self.store.finish(review['id'], review['lease'], {'status': 'done', 'readiness': {
             'ready': True, 'head_sha': 'c' * 40, 'checks_source': 'GitHub'}})
         self.assertEqual(self.store.snapshot()['ready'][0]['id'], review['id'])
+        rows = {row['id']: row for row in self.store.overview()['recent_tasks']}
+        self.assertTrue(rows[review['id']]['merge_ready'])
+        self.assertFalse(rows[item['id']]['merge_ready'])
 
     def test_comment_author_hands_fix_to_another_fresh_slot(self):
         self.store.upsert(self.fleet['id'], [candidate(1)])

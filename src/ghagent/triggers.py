@@ -155,17 +155,22 @@ def _flag_workflow_text(name: str, ref: str, text: str,
         if t in _BLOCKING_ALWAYS:
             _hold(report, f"workflow {name}@{ref} is triggered by {t} — this worker's writes could start it")
         elif t in _BLOCKING_UNLESS_ALLOW and not allow_workflows:
-            _hold(report, f"workflow {name}@{ref} is triggered by {t} — our push could start "
-                          "GitHub Actions (allowlist this repo to waive)")
+            _hold(report, f"workflow {name}@{ref} is triggered by {t} — a push could start "
+                          "GitHub Actions. To permit this, turn on 'Allow GitHub Actions' "
+                          "for this repository in Settings.")
         elif t == "schedule":
             report.details.setdefault("schedule_workflows", []).append(f"{name}@{ref}")
     steps = _step_flags(text)
     if steps:
         _hold(report, f"workflow {name}@{ref} contains publish/package/deploy/pages steps: {', '.join(steps)}")
     runners = _hosted_runners(text)
-    if runners and set(trig) & (_BLOCKING_ALWAYS | _BLOCKING_UNLESS_ALLOW):
+    firing = set(trig) & _BLOCKING_ALWAYS
+    if not allow_workflows:
+        firing |= set(trig) & _BLOCKING_UNLESS_ALLOW
+    if runners and firing:
         _hold(report, f"workflow {name}@{ref} runs on GitHub-hosted runners ({', '.join(runners)}) "
-                      "on a trigger this work could fire")
+                      "on a trigger this work could fire. If these minutes are already paid for, "
+                      "turn on 'Allow GitHub Actions' for this repository in Settings.")
 
 
 def _inspect_workflows(gh, repo_full_name: str, ref: str,

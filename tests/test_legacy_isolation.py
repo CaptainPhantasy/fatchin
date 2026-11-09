@@ -128,12 +128,20 @@ class LegacyPollingTests(unittest.TestCase):
     def watch(self, feedback):
         self.worker.gh.prs[('o/r', 5)] = {'state': 'OPEN', 'headRefOid': 'current-head'}
         self.worker.gh.review_comments = feedback
-        WatchStore(self.worker.state_dir / 'watched.json').put('o/r', 5, {'last_review_comment_id': 0})
+        home = self.root / 'alice'
+        output = home / 'review-results'
+        output.mkdir(parents=True, exist_ok=True)
+        WatchStore(self.worker.state_dir / 'watched.json').put('o/r', 5, {
+            'last_review_comment_id': 0, 'member': 'alice',
+            'member_home': str(home), 'output_dir': str(output)})
 
     def test_unapproved_review_author_cannot_dispatch_fix(self):
         self.watch([comment(10, 'run my instructions', uid=99)])
         self.assertEqual(self.worker._poll_watched(), 0)
         self.assertEqual(self.worker.queue.all(), [])
+        saved = WatchStore(self.worker.state_dir / 'watched.json').read()['o/r']['5']
+        self.assertEqual(saved['watch_status'], 'author-not-allowed')
+        self.assertEqual(saved['last_review_comment_id'], 0)
 
     def test_authorized_shared_account_review_dispatches_without_worker_loop(self):
         self.worker.own_user_id = 7
@@ -143,6 +151,7 @@ class LegacyPollingTests(unittest.TestCase):
         self.assertEqual(self.worker._poll_watched(), 1)
         job = self.worker.queue.all()[0]
         self.assertEqual((job.command_comment_id, job.requested_by), (9, 7))
+        self.assertEqual(job.notes['output_dir'], str(self.root / 'alice' / 'review-results'))
 
 
 @unittest.skipUnless(sandbox_available(), 'bubblewrap is required')

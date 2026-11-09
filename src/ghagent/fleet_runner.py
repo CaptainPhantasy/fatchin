@@ -15,7 +15,6 @@ import os
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -365,7 +364,7 @@ class Task:
         name = repo or self.source_repo
         policy = next((r for r in self.cfg.repos if r.full_name.casefold() == name.casefold()), None)
         report = triggers.preflight(self.gh, name, head_ref=ref or self.source_ref,
-                                    allow_workflows=False,
+                                    allow_workflows=self.cfg.allow_workflows_for(name),
                                     allow_unknown_rulesets=bool(policy and policy.allow_unknown_rulesets))
         if report.verdict != triggers.SAFE:
             reason = report.reasons[0] if report.reasons else 'Automation could not be verified.'
@@ -717,7 +716,8 @@ class Task:
             raise FleetBlocked('The correction merge is not confirmed in the current source branch.')
         policy = next((r for r in self.cfg.repos if r.full_name.casefold() == self.source_repo.casefold()), None)
         report = triggers.preflight(self.gh, self.source_repo, head_ref=self.source_ref,
-                                    allow_workflows=False, allow_unknown_rulesets=bool(policy and policy.allow_unknown_rulesets))
+                                    allow_workflows=self.cfg.allow_workflows_for(self.source_repo),
+                                    allow_unknown_rulesets=bool(policy and policy.allow_unknown_rulesets))
         if report.verdict != triggers.SAFE:
             raise FleetBlocked('GitHub automation inspection held finding closure: ' + '; '.join(report.reasons))
         thread_id = self.item.get('thread_id')
@@ -956,6 +956,11 @@ class Task:
         expected = self.head if correction else None
         if self._remote_ref(self.source_repo, branch) != expected:
             raise FleetBlocked('The deterministic correction branch already exists or moved; it was not overwritten.')
+        from .secret_gate import SecretGateRefusal, check_commit, git_result
+        try:
+            check_commit(git_result(lambda argv: self.git(argv, check=False)), str(self.root), config=self.cfg)
+        except SecretGateRefusal as exc:
+            raise FleetBlocked(str(exc)) from None
         self.git(['-c', 'user.name=FatChin', '-c', 'user.email=fatchin@inference',
                   '-c', 'commit.gpgSign=false', 'commit', '-m', 'fix: ' + str(self.item.get('title') or 'address the recorded review finding')[:120]])
         commit = _valid_sha(self.git(['rev-parse', 'HEAD']).stdout.strip())
@@ -1003,7 +1008,8 @@ def _model(cfg, env, item, factory):
         return
     from .fleet_providers import model_config
     resolved, model_env = model_config(cfg, env, provider)
-    model_cfg = dataclasses.replace(resolved.model, max_calls_per_job=100, max_calls_per_day=sys.maxsize)
+    model_cfg = dataclasses.replace(resolved.model, max_calls_per_job=100,
+                                    max_calls_per_day=max(1, resolved.model.max_calls_per_day))
     bearer = make_bearer(dataclasses.replace(resolved, model=model_cfg), model_env)
     try:
         model = ModelClient(model_cfg, bearer, job_scope='fleet-' + str(item['id']),

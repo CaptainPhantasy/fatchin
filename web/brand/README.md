@@ -1,7 +1,7 @@
 # FatChin icon
 
 `fatchin-logo.png` is the owner's original PNG, supplied on October 19, 2026
-from `/Users/floyd/Downloads/fatchinlogo.png` on the Mac mini. The file is
+by the project owner. The file is
 1254 × 1254 pixels, RGBA, with its original transparency. It was copied without
 cropping, recoloring, or recompression.
 

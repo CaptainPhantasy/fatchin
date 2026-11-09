@@ -176,6 +176,10 @@ class WorktreeOpsAdapter:
             raise RuntimeError(f"git add failed: {add.stderr.strip()[:300]}")
         self._git(["rm", "-r", "--cached", "--quiet", "--ignore-unmatch",
                    "--", *self.ARTIFACT_PATHSPECS], cwd=wt)
+        # Nothing reaches the remote without passing the secret gate first.
+        from .secret_gate import check_commit, git_result
+        check_commit(git_result(lambda argv: self._git(argv, cwd=wt)),
+                     wt, config=self._cfg)
         commit = self._git(
             ["-c", "user.name=gha-worker",
              "-c", "user.email=gha-worker@inference",

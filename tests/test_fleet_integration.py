@@ -23,22 +23,30 @@ from tests.test_web_control import GuiFixture
 
 class FleetIntegrationTests(unittest.TestCase):
     def test_provider_pools_use_exact_models_and_private_runtime_settings(self):
-        cfg = Config(model=ModelConfig(max_calls_per_day=600, max_calls_per_job=100))
+        cfg = Config(model=ModelConfig(model_id='glm-5.3-flash', max_calls_per_day=600, max_calls_per_job=100))
         env = {'MCP_SECRET_BROKER_ADMIN_TOKEN': 'example-broker-value'}
         before = dataclasses.asdict(cfg)
         glm, _ = model_config(cfg, env, 'glm')
         deepseek, copied = model_config(cfg, env, 'deepseek')
-        self.assertEqual(glm.model.model_id, 'your-model')
-        self.assertEqual(deepseek.model.model_id, 'your-second-model')
+        self.assertEqual(glm.model.model_id, 'glm-5.3-flash')
+        self.assertEqual(deepseek.model.model_id, 'deepseek-flash')
         self.assertEqual(deepseek.model.base_url, cfg.model.broker_base_url + '/proxy/deepseek')
         self.assertEqual(deepseek.model.broker_server_id, 'deepseek')
         self.assertEqual(deepseek.model.max_calls_per_job, 100)
-        self.assertGreater(deepseek.model.max_calls_per_day, 1_000_000)
+        self.assertEqual(deepseek.model.max_calls_per_day, 600)
         self.assertEqual(dataclasses.asdict(cfg), before)
         self.assertEqual(env, copied)
         self.assertNotIn('example-broker-value', json.dumps(provider_status(cfg, env)))
         with self.assertRaises(ValueError):
             model_config(cfg, env, 'substitute')
+
+    def test_daily_ceiling_can_be_lowered_but_never_removed(self):
+        from ghagent.fleet_providers import FLEET_DAILY_CALLS_MAX, fleet_daily_ceiling
+        self.assertEqual(fleet_daily_ceiling(600), 600)
+        self.assertEqual(fleet_daily_ceiling(50), 50)
+        self.assertEqual(fleet_daily_ceiling(0), FLEET_DAILY_CALLS_MAX)
+        self.assertEqual(fleet_daily_ceiling(10 ** 9), FLEET_DAILY_CALLS_MAX)
+        self.assertGreaterEqual(fleet_daily_ceiling(-5), 1)
 
     def test_repository_locks_allow_different_fleet_targets_but_hold_legacy_writes(self):
         with tempfile.TemporaryDirectory() as state:
@@ -127,7 +135,7 @@ class FleetIntegrationTests(unittest.TestCase):
 class FleetControlTests(GuiFixture, unittest.TestCase):
     def setUp(self):
         self.build_gui()
-        self.config_path.write_text(self.config_path.read_text().replace('model_id = "model-a"', 'model_id = "your-model"'))
+        self.config_path.write_text(self.config_path.read_text().replace('model_id = "model-a"', 'model_id = "glm-5.3-flash"'))
         self.env_path.write_text(self.env_path.read_text() + 'MCP_SECRET_BROKER_ADMIN_TOKEN=example-broker-test\n')
         self.start = {'action': 'start', 'account': 'alice', 'output_dir': str(self.output),
                       'workers': 10, 'deepseek_workers': 10, 'scope': 'all'}

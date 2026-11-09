@@ -544,6 +544,9 @@ class WatchTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
         self.addCleanup(self._tmp.cleanup)
+        self.home = self.tmp / "test"
+        self.output = self.home / "project"
+        self.output.mkdir(parents=True)
 
     def _worker(self, gh=None, cfg=None):
         w = make_worker(self.tmp, gh=gh, cfg=cfg)
@@ -554,7 +557,8 @@ class WatchTests(unittest.TestCase):
     def _done_fix_job(self, w, job_id="job_w1", number=5):
         job = Job(job_id=job_id, kind=JobKind.FIX_PR, repo_full_name="o/r",
                   number=number, command_comment_id=1, requested_by=7,
-                  head_sha="abc123", dedup_key=f"fix-pr:o/r:{number}:abc123")
+                  head_sha="abc123", dedup_key=f"fix-pr:o/r:{number}:abc123",
+                  notes={"member": "test", "member_home": str(self.home), "output_dir": str(self.output)})
         w.queue.add(job)
         w._drain_jobs()          # FakeExecutor marks it DONE
         return job
@@ -601,7 +605,7 @@ class WatchTests(unittest.TestCase):
              "created_at": "2026-01-02T03:04:05Z",
              "user": {"id": 42, "login": "tester"}},
         ]
-        w = self._worker(gh=gh)
+        w = self._worker(gh=gh, cfg=make_cfg(self.tmp, allowed_command_users=[7, 42]))
         feedback = gh.review_comments
         gh.review_comments = []
         self._done_fix_job(w)
@@ -618,7 +622,7 @@ class WatchTests(unittest.TestCase):
              "created_at": "2026-01-02T03:04:05Z",
              "user": {"id": 9, "login": "copilot-bot"}},
         ]
-        w = self._worker(gh=gh)
+        w = self._worker(gh=gh, cfg=make_cfg(self.tmp, allowed_command_users=[7, 9]))
         feedback = gh.review_comments
         gh.review_comments = []
         self._done_fix_job(w)
@@ -633,8 +637,11 @@ class WatchTests(unittest.TestCase):
                          created_at=worker_mod._now_iso())
             w.queue.add(filler)
         self.assertEqual(w.poll_once(), 0)   # cap reached; feedback waits
+        saved = w.watches["o/r"]["5"]
+        self.assertEqual(saved["watch_status"], "daily-limit")
+        self.assertTrue(saved["cap_reset_at"])
 
-    def test_closed_pr_watch_is_dropped(self):
+    def test_closed_pr_watch_keeps_its_history_and_stops_follow_up(self):
         gh = FakeGh()
         gh.prs[("o/r", 5)] = {"state": "CLOSED", "headRefOid": "head456"}
         gh.review_comments = [
@@ -645,7 +652,9 @@ class WatchTests(unittest.TestCase):
         w = self._worker(gh=gh)
         self._done_fix_job(w)
         self.assertEqual(w.poll_once(), 0)
-        self.assertNotIn("5", w.watches.get("o/r", {}))
+        self.assertTrue(w.watches["o/r"]["5"]["closed"])
+        self.assertEqual(w.watches["o/r"]["5"]["watch_status"], "closed")
+        self.assertTrue(w.watches["o/r"]["5"]["closed_at"])
 
     def test_all_scope_discovers_current_and_future_prs_without_replaying_old_comments(self):
         from ghagent.control_store import WatchStore
@@ -660,7 +669,7 @@ class WatchTests(unittest.TestCase):
         gh.review_comments = [{'id': 100, 'body': 'Historical review', 'user': {'id': 7}}]
         w = self._worker(gh=gh)
         store = WatchStore(w.state_dir / 'watched.json')
-        store.put('o/r', '*', {'scope': 'all', 'output_dir': '/home/test/project', 'member': 'test'})
+        store.put('o/r', '*', {'scope': 'all', 'output_dir': str(self.output), 'member': 'test', 'member_home': str(self.home)})
         self.assertEqual(w.poll_once(), 0)
         self.assertEqual(store.read()['o/r']['5']['last_review_comment_id'], 100)
         gh.open_prs = [*gh.open_prs, {'number': 6, 'title': 'New PR'}]
@@ -671,7 +680,7 @@ class WatchTests(unittest.TestCase):
         self.assertTrue(all(paginate for method, path, body, paginate in gh.rest_calls
                             if '/pulls/' in path and path.endswith('/comments')))
         self.assertEqual({j.number for j in w.queue.all()}, {5, 6})
-        self.assertTrue(all(j.notes['output_dir'] == '/home/test/project' for j in w.queue.all()))
+        self.assertTrue(all(j.notes['output_dir'] == str(self.output) for j in w.queue.all()))
         store.remove('o/r', '*')
         self.assertEqual(w.poll_once(), 0)
         self.assertEqual(store.read(), {})

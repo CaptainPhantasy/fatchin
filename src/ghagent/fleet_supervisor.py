@@ -214,7 +214,7 @@ class FleetSupervisor:
             self._cursor = slot % MAX_WORKERS + 1
             if slot in busy_slots:
                 continue
-            claimed = self.store.claim(slot)
+            claimed = self.store.claim(slot, getattr(self.cfg, 'fleet_roles', None))
             if claimed:
                 self._launch(claimed)
                 last_claimed = slot

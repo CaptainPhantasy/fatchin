@@ -124,8 +124,25 @@ and the worker that wrote a finding does not take its own fix stage.
 
 | Pool | Model used | Maximum simultaneous tasks |
 | --- | --- | --- |
-| GLM | `your-model` through the existing GLM connection | 10 |
-| DeepSeek | `your-second-model`, the V4.1-Flash-1017 profile with a 1M-token context window | 10 |
+| GLM | `glm-5.3-flash` through the existing GLM connection | 10 |
+| DeepSeek | `deepseek-flash`, the V4.1-Flash-1017 profile with a 1M-token context window | 10 |
+
+Optional fleet controls in `config.toml`:
+
+```toml
+[model]
+min_seconds_between_calls = 1.5   # pacing per provider ledger; 0 = off
+
+[fleet_roles]                     # pin a task kind to a pool (only while that pool has workers)
+review_pr = "deepseek"
+fix_comment = "glm"
+
+[fleet_max_calls_per_day]         # per-provider daily stop (UTC); unset inherits model.max_calls_per_day
+glm = 4000
+deepseek = 3000
+```
+
+Label a pull request `fatchin-halted` to stop new review and fix work on it.
 
 A **token** is a small piece of text counted by the model. The DeepSeek context
 window describes that model’s capacity; it does not remove FatChin’s individual
@@ -138,8 +155,9 @@ If you stop and change the selected pools, pending tasks from a disabled pool
 can continue in the pool you selected. Their history and saved write records
 remain intact. A provider rate limit alone never switches the selected model.
 
-The fleet has its own model-call counters and continues independently of the
-ordinary worker’s daily call limit. Each task remains bounded. Subscription
+The fleet has its own per-provider model-call counters. An omitted daily
+override uses `model.max_calls_per_day` (600 in the example config); an explicit
+override is limited to 25,000 calls per provider per UTC day. Each task remains bounded. Subscription
 terms and provider limits still apply; this feature does not establish free or
 unlimited access to either provider.
 
@@ -342,3 +360,18 @@ node tests/gui-fleet.mjs http://127.0.0.1:PORT /home/YOUR_ACCOUNT/fleet-ui-check
 That command checks the browser against simulated API responses. Broader
 integration tests, provider probes and installed-service checks are
 deployment-specific; run them against your own installation.
+
+## Secret checks before publication
+
+The enabled secret gate examines the exact staged Git blobs before a commit.
+Changing or deleting the working copy after staging cannot hide the staged
+content. A failed index lookup, unreadable blob, incomplete scan or invalid
+allowlist holds the commit and gives a redacted explanation. Correct access,
+repair the checkout or allowlist, then retry; scanner errors never count as a
+clean scan. A known-safe `path:kind` acknowledgment cannot clear scan errors.
+
+This text scanner intentionally excludes binary, minified, vendor, cache,
+lockfile, submodule and files above its size threshold. Changes over 2,000
+entries must be split. It is one publication check, not proof that arbitrary
+secrets anywhere in a project can always be recognized. Release artifacts also
+receive the repository's steward audit.

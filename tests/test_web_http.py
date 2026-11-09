@@ -204,3 +204,27 @@ class GuiHttpTests(GuiFixture, unittest.TestCase):
         self.assertIn('result.bin', headers['Content-Disposition'])
         status, _, _ = self.request('GET', f'/api/jobs/{job.job_id}/download?path=../private.txt')
         self.assertEqual(status, 403)
+
+    def test_saved_deepseek_choice_roundtrips_through_browser_routes(self):
+        from unittest.mock import patch
+        with self.env_path.open('a') as out:
+            out.write('DEEPSEEK_API_KEY=fake-http-key\nMCP_SECRET_BROKER_ADMIN_TOKEN=fake-http-broker\n')
+        with patch('ghagent.model_client.ModelClient') as Client:
+            status, _, payload = self.request('POST', '/api/provider-source',
+                {'provider':'deepseek', 'source':'env'}, {'Origin':'http://' + self.host})
+            self.assertEqual(status, 200, payload)
+            self.assertTrue(json.loads(payload)['restart_required'])
+            status, _, payload = self.request('GET', '/api/state')
+            self.assertEqual(status, 200, payload)
+            row = next(p for p in json.loads(payload)['providers'] if p['id'] == 'deepseek')
+            self.assertEqual(row['credential_source'], 'env')
+            self.assertNotIn(b'fake-http', payload)
+            Client.assert_not_called()
+
+    def test_unavailable_connection_choice_returns_actionable_error_without_changing_files(self):
+        before = self.env_path.read_bytes()
+        status, _, payload = self.request('POST', '/api/provider-source',
+            {'provider':'deepseek', 'source':'env'}, {'Origin':'http://' + self.host})
+        self.assertEqual(status, 409, payload)
+        self.assertIn('settings', json.loads(payload)['actions_available'])
+        self.assertEqual(self.env_path.read_bytes(), before)

@@ -41,17 +41,34 @@
       "pending",
       "stopping",
     ].includes(jobState(job));
-  const canRetry = (job) => ["failed", "stopped"].includes(jobState(job));
+  const canRetry = (job) => ["failed", "stopped"].includes(jobState(job)) && !job.notes?.posting && job.notes?.publish_outcome !== "uncertain";
   const isComplete = (job) =>
     ["done", "completed", "succeeded"].includes(jobState(job));
-  const labelState = (value) =>
-    String(value || "").toLowerCase() === "received"
-      ? "Queued"
-      : String(value || "unknown")
-          .replace(/[_-]/g, " ")
-          .replace(/^\w/, (c) => c.toUpperCase());
+  const stateLabels = {
+    received: "Queued",
+    "waiting-on-you": "Waiting on you",
+    waiting_on_you: "Waiting on you",
+    awaiting_merge: "Waiting for your merge",
+    "awaiting-merge": "Waiting for your merge",
+  };
+  const labelState = (value) => {
+    const key = String(value || "unknown").toLowerCase();
+    return (
+      stateLabels[key] ||
+      key.replace(/[_-]/g, " ").replace(/^\w/, (c) => c.toUpperCase())
+    );
+  };
   const stateClass = (value) => {
     value = String(value || "").toLowerCase();
+    if (
+      [
+        "waiting-on-you",
+        "waiting_on_you",
+        "awaiting_merge",
+        "awaiting-merge",
+      ].includes(value)
+    )
+      return "gate";
     if (
       ["done", "completed", "succeeded", "active", "running", "pass"].includes(
         value,
@@ -60,9 +77,7 @@
       return "success";
     if (["failed", "error", "fail"].includes(value)) return "error";
     if (
-      ["stopped", "cancelled", "paused", "warn", "stopping", "waiting-on-you"].includes(
-        value,
-      )
+      ["stopped", "cancelled", "paused", "warn", "stopping"].includes(value)
     )
       return "warning";
     if (["working", "retrieving", "verifying", "responding"].includes(value))
@@ -72,6 +87,7 @@
   const badge = (state) =>
     `<span class="badge badge-${stateClass(state)}">${esc(labelState(state))}</span>`;
   const jobBadge = (job) =>
+    job.notes?.archived_at ? `<span class="badge">Archived · ${esc(labelState(job.state))}</span>` :
     job.notes?.result_export_error
       ? '<span class="badge badge-warning">Results need attention</span>'
       : badge(job.state);
@@ -102,9 +118,9 @@
     return date(value);
   };
   const targetURL = (repo, kind, n) =>
-    /^[\w.-]+\/[\w.-]+$/.test(repo || "") && /^\d+$/.test(String(n))
+    /^[\w.-]+\/[\w.-]+$/.test(repo || "") && Number(n) > 0 && /^\d+$/.test(String(n))
       ? `https://github.com/${encodeURI(repo)}/${(taskType(kind)?.takes || (kind === "fix-pr" ? "pr" : "issue")) === "pr" ? "pull" : "issues"}/${n}`
-      : "#";
+      : /^[\w.-]+\/[\w.-]+$/.test(repo || "") ? `https://github.com/${encodeURI(repo)}` : "#";
   const button = (text, action, name, cls = "", attrs = "") =>
     `<button type="button" class="button ${cls}" data-action="${esc(action)}" ${attrs}>${name ? icon(name) : ""}${esc(text)}</button>`;
   const empty = (name, title, description, action = "") =>
@@ -218,6 +234,7 @@
           response.status,
         );
         failure.hint = typeof result.hint === "string" ? result.hint : "";
+        failure.actions = list(result.actions_available);
         throw failure;
       }
       if (typeof result.hint === "string") noticeHint(result.hint);
@@ -241,16 +258,27 @@
       clearTimeout(timeout);
     }
   }
+  function errorMessage(error) {
+    return [...new Set([error?.message || String(error), error?.hint].filter(Boolean))].join(" ");
+  }
+  function recoveryLinks(actions) {
+    const links = {"open-fleet": ["Open fleet work", "recovery-fleet"], "open-watches": ["Open review watches", "recovery-watches"], "open-tasks": ["Open tasks", "recovery-jobs"], "worker-controls": ["Open worker controls", "go-settings"], reload: ["Refresh saved status", "refresh"], diagnostics: ["Open setup checks", "diagnostics"], settings: ["Open settings", "go-settings"], help: ["Read help", "recovery-help"], fleet: ["Open saved fleet", "recovery-fleet"], jobs: ["Open tasks", "recovery-jobs"], watches: ["Open review watches", "recovery-watches"]};
+    return `<div class="recovery-actions">${list(actions).filter(a => links[a]).map(a => button(links[a][0], links[a][1], "", "button-small")).join("")}</div>`;
+  }
   function toast(message, error = false) {
     const el = document.createElement("div");
     el.className = `toast${error ? " error" : ""}`;
     el.innerHTML = `${icon(error ? "alert" : "check-circle")}<span>${esc(message)}</span><button class="icon-button" aria-label="Dismiss notification">${icon("x")}</button>`;
     $("button", el).addEventListener("click", () => el.remove());
     $("#toast-region").append(el);
-    setTimeout(() => el.remove(), error ? 14000 : 7000);
+    if (!error) setTimeout(() => el.remove(), 7000);
   }
   function reportError(error) {
-    toast(error.message, true);
+    if(folderDialog.open){dialogError(error,$("#folder-body"));return;}
+    if(dialog.open){dialogError(error);return;}
+    toast(errorMessage(error), true);
+    const notice = $("#toast-region").lastElementChild;
+    if (notice) notice.insertAdjacentHTML("beforeend", recoveryLinks(error.actions));
     if (error.status === 409) refresh(true);
   }
   // A reply may carry a next-step hint. It never blocks anything: a repeated
@@ -268,7 +296,7 @@
     const el = document.createElement("div");
     el.className = "dialog-error";
     el.setAttribute("role", "alert");
-    el.textContent = error.message;
+    el.innerHTML = `<p>${esc(errorMessage(error))}</p>${recoveryLinks(error.actions)}`;
     root.prepend(el);
     root.scrollTop = 0;
     if (error.status === 409) refresh(true);
@@ -317,13 +345,13 @@
     if (!list(fleet.fleets).length) return "";
     const active = fleet.active_agents || {}, configured = fleet.configured_agents || {};
     const error = fleet.supervisor?.discovery_error || list(fleet.fleets).map((f) => f.error).find(Boolean);
-    return `<section id="workspace-fleet-status" class="panel workspace-fleet-status" aria-label="Live account-wide fleet"><div><strong>${icon("watch")}${number(fleet.repository_count)} repositories in your fleet</strong><span>${esc(list(fleet.fleets).every((f) => f.status === "paused") ? "Paused after current tasks" : "Watching PRs, comments and code · at most 4 agents per repository")}</span></div><div class="workspace-provider"><strong>GLM</strong><span>${number(active.glm)} working · ${number(configured.glm)} configured</span></div><div class="workspace-provider"><strong>DeepSeek</strong><span>${number(active.deepseek)} working · ${number(configured.deepseek)} configured</span></div><a class="button button-small" href="#fleet">Open agent fleet ${icon("arrow")}</a>${error ? `<p class="field-error">${esc(error)}</p>` : ""}</section>`;
+    return `<section id="workspace-fleet-status" class="panel workspace-fleet-status" aria-label="Live account-wide fleet"><div><strong>${icon("watch")}${number(fleet.repository_count)} repositories being checked by your fleet</strong><span>${esc(list(fleet.fleets).every((f) => f.status === "stopped") ? "Stopped · saved results and unresolved work are kept below" : list(fleet.fleets).every((f) => f.status !== "running") ? "Paused · current results are kept" : "Watching PRs, comments and code · at most 4 agents per repository")}</span></div><div class="workspace-provider"><strong>GLM</strong><span>${number(active.glm)} working · ${number(configured.glm)} configured</span></div><div class="workspace-provider"><strong>DeepSeek</strong><span>${number(active.deepseek)} working · ${number(configured.deepseek)} configured</span></div><a class="button button-small" href="#fleet">Open agent fleet ${icon("arrow")}</a>${error ? `<p class="field-error">${esc(error)}</p>` : ""}</section>`;
   }
   function coveragePanel() {
     const all = watchedRepositories();
     if (!list(workspaceFleet().fleets).length) return "";
     const rows = all.filter((r) => r.repo.toLowerCase().includes(A.coverageSearch.toLowerCase()));
-    return `<section class="panel fleet-coverage"><div class="panel-header"><div><h2>Watched repositories <span class="count">${number(all.length)}</span></h2><p>Every project discovered in your fleet’s current scope. New accessible projects join future scans.</p></div><a href="#fleet">Manage fleet ${icon("arrow")}</a></div><div class="toolbar"><div class="search-field">${icon("search")}<input id="coverage-search" type="search" aria-label="Search watched repositories" placeholder="Find a watched repository…" value="${esc(A.coverageSearch)}"></div><span class="muted">${number(rows.length)} of ${number(all.length)} projects</span></div><div class="coverage-scroll"><table class="coverage-table"><thead><tr><th>Repository</th><th>Following</th><th>Work</th><th>Status</th></tr></thead><tbody>${rows.map((r) => `<tr><td><a href="https://github.com/${encodeURI(r.repo).replace(/"/g, "%22")}" target="_blank" rel="noopener noreferrer">${esc(r.repo)} ${icon("external")}</a></td><td>Pull requests, comments and code</td><td>${number(r.tasks?.running)} active · ${number(r.tasks?.queued)} queued${r.tasks?.blocked ? `<span class="cell-sub">${number(r.tasks.blocked)} need attention</span>` : ""}</td><td>${badge(r.status)}</td></tr>`).join("")}</tbody></table>${rows.length ? "" : empty("repo", all.length ? "No matching repository" : "Discovering your repositories", all.length ? "Try another project name." : "The fleet is reading the repositories accessible to your connected GitHub account.")}</div></section>`;
+    return `<section class="panel fleet-coverage"><div class="panel-header"><div><h2>Watched repositories <span class="count">${number(all.length)}</span></h2><p>Every project discovered in your fleet’s current scope. New accessible projects join future scans.</p></div><a href="#fleet">Manage fleet ${icon("arrow")}</a></div><div class="toolbar"><div class="search-field">${icon("search")}<input id="coverage-search" type="search" aria-label="Search watched repositories" placeholder="Find a watched repository…" value="${esc(A.coverageSearch)}"></div><span class="muted">${number(rows.length)} of ${number(all.length)} projects</span></div><div class="coverage-scroll"><table class="coverage-table"><thead><tr><th>Repository</th><th>Following</th><th>Work</th><th>Status</th></tr></thead><tbody>${rows.map((r) => `<tr><td><a href="https://github.com/${encodeURI(r.repo).replace(/"/g, "%22")}" target="_blank" rel="noopener noreferrer">${esc(r.repo)} ${icon("external")}</a></td><td>Pull requests, comments and code</td><td>${number(r.tasks?.running)} active · ${number(r.tasks?.queued)} queued${r.tasks?.blocked ? `<span class="cell-sub">${number(r.tasks.blocked)} need attention</span>` : ""}</td><td>${badge(r.status)}</td></tr>`).join("")}</tbody></table>${rows.length ? "" : empty("repo", all.length ? "No matching repository" : list(workspaceFleet().fleets).some(f=>f.status==="running") ? "Discovering your repositories" : "This fleet is not checking projects right now", all.length ? "Try another project name." : list(workspaceFleet().fleets).some(f=>f.status==="running") ? "The fleet is reading the repositories accessible to your connected GitHub account." : "Its saved results and unresolved work remain in Agent fleet. Resume it there when you want new checks.", button("Open saved fleet work","recovery-fleet","arrow","button-small"))}</div></section>`;
   }
   function fleetTasksPanel() {
     const fleet = workspaceFleet();
@@ -332,7 +360,7 @@
       (A.repoFilter === "all" || i.repo === A.repoFilter) &&
       (A.jobsFilter === "all" || (A.jobsFilter === "active" ? ["queued","running","retrying"].includes(i.status) : A.jobsFilter === "failed" ? ["blocked","failed"].includes(i.status) : i.status === A.jobsFilter)) &&
       `${i.title} ${i.repo} ${i.kind}`.toLowerCase().includes(A.jobsSearch.toLowerCase()));
-    return `<section class="panel"><div class="panel-header"><div><h2>Fleet tasks</h2><p>${number(fleet.task_counts?.running)} working · ${number(fleet.task_counts?.queued)} queued · ${number(fleet.task_counts?.blocked)} need attention. Showing recent work; use the fleet window for the full queue.</p></div><a href="#fleet">All fleet work ${icon("arrow")}</a></div><div class="table-wrap"><table class="jobs-table fleet-task-table"><thead><tr><th>Task</th><th>Repository</th><th>Agent</th><th>Status</th><th>Next step</th></tr></thead><tbody>${rows.map((i) => `<tr><td>${esc(i.title || labelState(i.kind))}<span class="cell-sub">${esc(labelState(i.kind))}</span></td><td>${esc(i.repo)}</td><td>${esc(i.provider === "deepseek" ? "DeepSeek" : i.provider === "glm" ? "GLM" : "Waiting for an agent")}${i.slot ? ` · ${esc(i.slot)}` : ""}</td><td>${badge(i.status)}</td><td><button class="button button-small" data-action="fleet-open-item" data-repo="${esc(i.repo)}" data-title="${esc(i.title || "")}">${i.status === "blocked" ? "Read issue and continue" : "Follow in agent fleet"} ${icon("arrow")}</button></td></tr>`).join("")}</tbody></table></div></section>`;
+    return `<section class="panel"><div class="panel-header"><div><h2>Fleet tasks</h2><p>${number(fleet.task_counts?.running)} working · ${number(fleet.task_counts?.queued)} queued · ${number(fleet.task_counts?.blocked)} ${Number(fleet.task_counts?.blocked) === 1 ? "needs you" : "need you"}. Showing up to ten recent items; open All fleet work for the complete queue and history.</p></div><a href="#fleet">All fleet work ${icon("arrow")}</a></div><div class="table-wrap"><table class="jobs-table fleet-task-table"><thead><tr><th>Task</th><th>Repository</th><th>Agent</th><th>Status</th><th>Next step</th></tr></thead><tbody>${rows.slice(0,10).map((i) => `<tr><td>${esc(i.title || labelState(i.kind))}<span class="cell-sub">${esc(labelState(i.kind))}</span></td><td>${esc(i.repo)}</td><td>${esc(i.provider === "deepseek" ? "DeepSeek" : i.provider === "glm" ? "GLM" : "Waiting for an agent")}${i.slot ? ` · ${esc(i.slot)}` : ""}</td><td>${i.merge_ready === true ? '<span class="badge badge-gate">Ready for your merge</span>' : badge(i.status)}</td><td><button class="button button-small${i.status === "blocked" || i.merge_ready === true ? "" : " button-quiet"}" data-action="fleet-open-item" data-id="${esc(i.id)}" data-tab="${i.merge_ready === true ? "ready" : "agents"}" data-repo="${esc(i.repo)}" data-title="${esc(i.title || "")}">${i.status === "blocked" ? "Read issue and continue" : i.merge_ready === true ? "Open merge step" : "Follow in agent fleet"} ${icon("arrow")}</button></td></tr>`).join("")}</tbody></table></div></section>`;
   }
   function settings() {
     return A.state?.settings || {};
@@ -340,7 +368,50 @@
   function fleetSettingsPanel() {
     const fleets = list(workspaceFleet().fleets);
     if (!fleets.length) return "";
-    return `<section class="panel settings-section"><div class="panel-header"><div><h2>Account-wide fleet controls</h2><p>These controls apply to both GLM and DeepSeek across your watched repositories.</p></div></div><div class="panel-body">${fleets.map((f) => `<div class="fleet-control-summary"><div><strong>${esc(f.account)}</strong><span>Reports: ${esc(f.output_dir)}</span></div><div class="heading-actions">${button(f.status === "paused" ? "Resume fleet" : "Pause after current tasks", f.status === "paused" ? "fleet-resume" : "fleet-pause", f.status === "paused" ? "play" : "pause", "button-small", `data-id="${esc(f.id)}"`)}${button("Stop fleet", "fleet-stop", "stop", "button-small", `data-id="${esc(f.id)}"`)}<a class="button button-small" href="#fleet">Agent counts and repository scope</a></div></div>`).join("")}</div></section>`;
+    return `<section class="panel settings-section"><div class="panel-header"><div><h2>Account-wide fleet controls</h2><p>These controls apply to both GLM and DeepSeek across your watched repositories.</p></div></div><div class="panel-body">${fleets.map((f) => {
+      const held = ["paused", "stopped"].includes(f.status);
+      const budget = f.max_calls_total && Number(f.calls_used) >= Number(f.max_calls_total);
+      return `<div class="fleet-control-summary"><div><strong>${esc(f.account)}</strong><span>${esc(labelState(f.status))} · Reports: ${esc(f.output_dir)}</span>${held ? '<p class="field-hint">Saved work stays here. Review resuming when you want automatic work to continue.</p>' : ""}</div><div class="heading-actions">${held ? button(budget ? "Choose an additional call budget" : "Review resuming fleet", budget ? "recovery-budget" : "recovery-review-resume", "play", "button-small", `data-fleet-id="${esc(f.id)}"`) : button("Pause after current tasks", "fleet-pause", "pause", "button-small", `data-id="${esc(f.id)}"`)}${f.status !== "stopped" ? button("Stop fleet", "fleet-stop", "stop", "button-small", `data-id="${esc(f.id)}"`) : ""}<a class="button button-small" href="#fleet">Agent counts and repository scope</a></div></div>`;
+    }).join("")}</div></section>`;
+  }
+  async function freshFleetDecision(id) {
+    openDialog("Read saved fleet settings", "REVIEW BEFORE CONTINUING", loading("Reading the latest project selection and model-call budget. No work is started."), button("Cancel", "dialog-close"));
+    const version = A.dialogVersion;
+    try {
+      const state = await api("/api/state");
+      if (!currentDialog(version)) return null;
+      const fleet = list(state.fleet_summary?.fleets).find(f => f.id === id);
+      if (!fleet) throw new Error("This saved fleet is no longer available. Open Agent fleet and choose its current settings.");
+      return fleet;
+    } catch(error) {
+      if(currentDialog(version))dialogError(error);
+      return null;
+    }
+  }
+  async function reviewFleetResume(id) {
+    const f = await freshFleetDecision(id);
+    if (!f) return;
+    if (f.max_calls_total && Number(f.calls_used) >= Number(f.max_calls_total)) return showFleetBudget(f);
+    const scope = f.scope === "all" ? "all accessible writable projects" : list(f.repos).join(", ");
+    return confirmDialog("Resume this fleet?", `${f.account}: resume automatic work for ${scope || "its saved project selection"}. This can start model requests and GitHub updates under the saved call budget. Earlier runs, results and history stay kept.`, "Resume fleet", async () => {
+      await mutateFleet("resume", {fleet_id:f.id});
+      if (F.error) throw new Error(F.error);
+    });
+  }
+  function showFleetBudget(f) {
+    openDialog("Choose how much more work to authorize", "YOUR MODEL USAGE DECISION", `<p>This fleet has used ${number(f.calls_used)} of ${number(f.max_calls_total)} authorized calls. Choose a specific additional allowance, or leave it paused. A model call asks your selected provider to do work and may use a paid allowance.</p><form id="budget-form">${field("additional-calls","Additional calls to authorize",10,"The existing count stays recorded. This adds to the authorized total.","number",'min="1" max="10000" step="1" required')}</form>`, `${button("Leave paused","dialog-close")}<button class="button button-primary" type="submit" form="budget-form">Authorize this allowance and resume</button>`);
+    const version = A.dialogVersion;
+    $("#budget-form").addEventListener("submit", event => {
+      event.preventDefault();
+      if (F.busy) return;
+      const amount = Number($("#additional-calls").value);
+      busy($('[form="budget-form"]'), async () => {
+        await mutateFleet("authorize_budget", {fleet_id:f.id, additional_calls:amount});
+        if(!currentDialog(version))return;
+        if(F.error)dialogError(new Error(F.error));
+        else closeDialog();
+      });
+    });
   }
   function model() {
     return { ...(settings().model || {}), ...(A.state?.model || {}) };
@@ -473,10 +544,10 @@
           main.innerHTML = empty(
             "alert",
             "Your worker is unavailable",
-            error.message,
+            errorMessage(error),
             button("Try again", "refresh", "refresh", "button-primary"),
           );
-        else if (render) toast(error.message, true);
+        else if (render) toast(errorMessage(error), true);
         return false;
       } finally {
         A.refreshing = null;
@@ -489,25 +560,25 @@
   }
   function pendingBanner() {
     return A.state?.service?.restart_required
-      ? `<div class="banner banner-warning">${icon("alert")}<div><strong>Saved changes are waiting for a restart</strong>Restart the worker to apply repository and settings changes. A restart requires an idle worker. Stop queued or running tasks first, then wait for the current step to finish.</div>${button("Restart worker", "service-restart", "refresh", "button-small")}</div>`
+      ? `<div class="banner banner-warning">${icon("alert")}<div><strong>Saved changes are waiting for a restart</strong>Restart the worker to apply repository and settings changes. A restart requires an idle worker. Stop queued or running tasks first, then wait for the current step to finish. Saved drafts stay available across a restart.</div>${button("Restart worker", "service-restart", "refresh", "button-small")}</div>`
       : "";
   }
   function activity(job) {
     const title =
       job.notes?.title ||
       `${taskType(job.kind)?.takes === "pr" || job.kind === "fix-pr" ? "Pull request" : "Issue"} #${job.number}`;
-    return `<div class="activity-row"><div class="activity-icon">${icon((taskType(job.kind)?.takes || (job.kind === "fix-pr" ? "pr" : "issue")) === "pr" ? "pr" : "issue")}</div><div class="activity-info"><button class="row-button" data-action="job-detail" data-id="${esc(job.job_id)}"><strong>${esc(title)}</strong><small><span>${esc(job.repo_full_name || job.repo)} #${esc(job.number)}</span><span>·</span><span>${esc(kindLabel(job.kind))}</span></small></button></div><div class="activity-meta">${jobBadge(job)}<small>${esc(ago(job.updated_at || job.created_at))}</small></div></div>`;
+    return `<div class="activity-row${jobState(job) === "waiting-on-you" ? " row-attention" : ""}"><div class="activity-icon">${icon((taskType(job.kind)?.takes || (job.kind === "fix-pr" ? "pr" : "issue")) === "pr" ? "pr" : "issue")}</div><div class="activity-info"><button class="row-button" data-action="job-detail" data-id="${esc(job.job_id)}"><strong>${esc(title)}</strong><small><span>${esc(job.repo_full_name || job.repo)} #${esc(job.number)}</span><span>·</span><span>${esc(kindLabel(job.kind))}</span></small></button></div><div class="activity-meta">${jobBadge(job)}<small>${esc(ago(job.updated_at || job.created_at))}</small></div></div>`;
   }
   function renderOverview() {
     const state = A.state;
     const s = state.service || {};
     const m = model();
     const summary = state.summary || {};
-    const recent = jobs().slice(0, 5);
+    const recent = jobs().filter(j => !j.notes?.archived_at).slice(0, 5);
     const active = jobs().filter(isActive).length;
-    return `${pageHeading("Your work, moving forward.", "Choose a project, give FatChin a task, and follow its checks and results here.")}${pendingBanner()}
+    return `${pageHeading("Your work, moving forward.", "Review progress across your projects, follow the evidence, and decide what ships. FatChin never merges — that decision stays with you.")}${pendingBanner()}
       ${!state.github?.configured ? `<div class="banner banner-warning">${icon("github")}<div><strong>Connect GitHub to get started</strong>${esc(state.github?.error || "Connect an account with access to the repositories you want to work on.")}</div>${button("Connect GitHub", "github-connect", "external", "button-small")}</div>` : ""}
-      <section class="hero" aria-label="Start a task"><div><p class="eyebrow">FROM FEEDBACK TO FINISHED</p><h2>A clear next step<br>for your GitHub project.</h2><p>A repository is your project on GitHub. Ask FatChin to explain it, prepare a change, or fix review feedback. You choose the project and results folder, then review what the task can change.</p>${button("Create a task", "new-task", "plus", "button-primary")}<a class="button button-quiet" href="#help">See how it works ${icon("arrow")}</a></div><div class="hero-graphic" aria-hidden="true"><div class="hero-node">${icon("issue")}</div><div class="hero-node">${icon("branch")}</div><div class="hero-node">${icon("check-circle")}</div></div></section>
+      <section class="hero" aria-label="Start a task"><div><p class="eyebrow">FROM FEEDBACK TO FINISHED</p><h2>A clear next step<br>for your GitHub project.</h2><p>Get a project explained, prepare a change, or resolve review feedback. Choose the project and results folder, review the scope, and follow each check. You approve the final merge on GitHub.</p>${button("Create a task", "new-task", "plus", "button-primary")}<a class="button button-quiet" href="#help">See how it works ${icon("arrow")}</a></div><div class="hero-graphic" aria-hidden="true"><div class="hero-node">${icon("issue")}</div><div class="hero-node">${icon("branch")}</div><div class="hero-node">${icon("check-circle")}</div></div></section>
       <section class="metrics" aria-label="Workspace statistics">${[
         [
           "Active tasks",
@@ -534,15 +605,16 @@
             `<div class="metric"><div class="metric-top">${label}${icon(name)}</div><div class="metric-value">${number(value)}</div><p class="metric-caption">${esc(caption)}</p></div>`,
         )
         .join("")}</section>
-      ${fleetTasksPanel()}<div class="dashboard-grid"><section class="panel"><div class="panel-header"><div><h2>Individual task activity</h2><p>Your latest manually queued tasks</p></div><a href="#jobs">View all tasks ${icon("arrow")}</a></div>${recent.length ? `<div class="activity-list">${recent.map(activity).join("")}</div>` : empty("jobs", "A fresh start", "Your tasks will appear here as you create them.", button("Create your first task", "new-task", "plus", "button-small"))}</section>
-      <section class="panel"><div class="panel-header"><div><h2>Worker status</h2><p>The service doing the work behind the scenes</p></div>${badge(s.active ? "running" : "stopped")}</div><div class="status-list"><div class="status-row"><span>${icon("github")}GitHub account</span><strong>${esc(state.github?.login || "Not connected")}</strong></div><div class="status-row"><span>${icon("spark")}Single-task model</span><strong>${esc(m.model_id || "Not configured")}</strong></div><div class="status-row"><span>${icon("clock")}Checks for updates</span><strong>${s.polling_enabled === false ? "Paused" : `Every ${number(s.poll_interval_seconds || settings().poll_interval_seconds)} seconds`}</strong></div><div class="status-row"><span>${icon("watch")}Watched repositories</span><strong>${number(new Set([...watches().map((w) => w.repo), ...watchedRepositories().map((r) => r.repo)]).size)} covered</strong></div></div><div class="panel-actions">${s.active ? button(s.polling_enabled === false ? "Resume polling" : "Pause polling", s.polling_enabled === false ? "service-resume" : "service-pause", s.polling_enabled === false ? "play" : "pause", "button-small") : button("Start worker", "service-start", "play", "button-small")}${button("Manage", "go-settings", "settings", "button-small")}</div><div class="panel-note">${s.current_job_id ? `Busy with a run for ${esc(s.member || s.current_member || "a member")} · ${esc(s.current_job_id)}<br>` : ""}${s.last_poll_iso ? `Last update check: ${esc(date(s.last_poll_iso))}` : "No update check has been recorded yet."}</div></section></div>
+      ${fleetTasksPanel()}<div class="dashboard-grid"><section class="panel"><div class="panel-header"><div><h2>Individual task activity</h2><p>Recent tasks and their latest results</p></div><a href="#jobs">View all tasks ${icon("arrow")}</a></div>${recent.length ? `<div class="activity-list">${recent.map(activity).join("")}</div>` : empty("jobs", "A fresh start", "Your tasks will appear here as you create them. Drafts that need a decision are marked Waiting on you. You still merge on GitHub.", button("Create your first task", "new-task", "plus", "button-primary"))}</section>
+      <section class="panel"><div class="panel-header"><div><h2>Worker status</h2><p>Connection, polling, and repository coverage</p></div>${badge(s.active ? "running" : "stopped")}</div><div class="status-list"><div class="status-row"><span>${icon("github")}GitHub account</span><strong>${esc(state.github?.login || "Not connected")}</strong></div><div class="status-row"><span>${icon("spark")}Single-task model</span><strong>${esc(m.model_id || "Not configured")}</strong></div><div class="status-row"><span>${icon("clock")}Checks for updates</span><strong>${s.polling_enabled === false ? "Paused" : `Every ${number(s.poll_interval_seconds || settings().poll_interval_seconds)} seconds`}</strong></div><div class="status-row"><span>${icon("watch")}Watched repositories</span><strong>${number(new Set([...watches().map((w) => w.repo), ...watchedRepositories().map((r) => r.repo)]).size)} covered</strong></div></div><div class="panel-actions">${s.active ? button(s.polling_enabled === false ? "Resume polling" : "Pause polling", s.polling_enabled === false ? "service-resume" : "service-pause", s.polling_enabled === false ? "play" : "pause", "button-small") : button("Start worker", "service-start", "play", "button-small button-primary")}${button("Manage", "go-settings", "settings", "button-small button-quiet")}</div><div class="panel-note">${s.current_job_id ? `Busy with a run for ${esc(s.member || s.current_member || "a member")} · ${esc(s.current_job_id)}<br>` : ""}${s.last_poll_iso ? `Last update check: ${esc(date(s.last_poll_iso))}` : "No update check has been recorded yet."}</div></section></div>
       <section class="quick-actions" aria-label="Quick actions"><a class="quick-action" href="#learn">${icon("help")}<span><strong>Explore a project or learn Git</strong><small>Read the code, then practice one explained move at a time</small></span>${icon("arrow","arrow-icon")}</a><button class="quick-action" data-action="new-repo">${icon("repo")}<span><strong>Add a repository</strong><small>Work across more of your projects</small></span>${icon("arrow", "arrow-icon")}</button><button class="quick-action" data-action="new-watch">${icon("watch")}<span><strong>Watch pull request reviews</strong><small>Follow up when new feedback arrives</small></span>${icon("arrow", "arrow-icon")}</button><a class="quick-action" href="#help">${icon("help")}<span><strong>Make yourself at home</strong><small>A quick guide to your workspace</small></span>${icon("arrow", "arrow-icon")}</a></section>`;
   }
   function renderJobs() {
     const all = jobs();
     const filtered = all.filter(
       (j) =>
-        (A.jobsFilter === "all" ||
+        (A.jobsFilter === "archived" ? Boolean(j.notes?.archived_at) : !j.notes?.archived_at) &&
+        (A.jobsFilter === "all" || A.jobsFilter === "archived" ||
           (A.jobsFilter === "active"
             ? isActive(j)
             : A.jobsFilter === "done"
@@ -553,13 +625,14 @@
           .toLowerCase()
           .includes(A.jobsSearch.toLowerCase()),
     );
-    return `${pageHeading("Tasks", "See what FatChin is doing, read its results, and stop or retry a task when needed.", button("New task", "new-task", "plus", "button-primary"))}${pendingBanner()}${fleetTasksPanel()}<section class="panel"><div class="toolbar"><div class="search-field">${icon("search")}<input id="jobs-search" aria-label="Search tasks" placeholder="Search tasks or repositories…" value="${esc(A.jobsSearch)}"></div><div class="filter-group"><select id="jobs-filter" aria-label="Filter by task status">${[
+    return `${pageHeading("Tasks", "See what FatChin is doing, read its results, and stop or retry a task when needed. You merge finished pull requests on GitHub.", button("New task", "new-task", "plus", "button-primary"))}${pendingBanner()}${fleetTasksPanel()}<section class="panel"><div class="toolbar"><div class="search-field">${icon("search")}<input id="jobs-search" aria-label="Search tasks" placeholder="Search tasks or repositories…" value="${esc(A.jobsSearch)}"></div><div class="filter-group"><select id="jobs-filter" aria-label="Filter by task status">${[
       ["all", "All statuses"],
       ["active", "Active"],
       ["waiting-on-you", "Waiting on you"],
       ["done", "Completed"],
       ["failed", "Failed"],
       ["stopped", "Stopped"],
+      ["archived", "Archived history"],
     ]
       .map(
         ([v, l]) =>
@@ -581,7 +654,7 @@
       )
       .join(
         "",
-      )}</select></div></div>${filtered.length ? `<div class="table-wrap"><table class="jobs-table"><thead><tr><th>Task</th><th>Repository</th><th>Status</th><th>Model calls</th><th>Updated</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>${filtered.map((j) => `<tr><td><button class="cell-title" data-action="job-detail" data-id="${esc(j.job_id)}">${esc(j.notes?.title || `${kindLabel(j.kind)}${j.number ? ` #${j.number}` : ""}`)}</button><span class="cell-sub">${esc(kindLabel(j.kind))}${j.number ? ` · #${esc(j.number)}` : ""}</span></td><td>${esc(j.repo_full_name || j.repo)}</td><td>${jobBadge(j)}</td><td>${number(j.model_calls_used)}</td><td><span title="${esc(date(j.updated_at || j.created_at))}">${esc(ago(j.updated_at || j.created_at))}</span></td><td><div class="table-actions"><button class="icon-button" data-action="job-detail" data-id="${esc(j.job_id)}" aria-label="Open task details">${icon("chevron")}</button></div></td></tr>`).join("")}</tbody></table></div><div class="table-foot">${filtered.length} of ${all.length} tasks · Select a task to see its results and controls.</div>` : empty("jobs", all.length ? "No matching tasks" : "Your task history starts here", all.length ? "Try a different search or status filter." : "Create a task to fix a pull request or implement an issue.", all.length ? "" : button("Create a task", "new-task", "plus", "button-primary"))}</section>`;
+      )}</select></div></div>${filtered.length ? `<div class="table-wrap"><table class="jobs-table"><thead><tr><th>Task</th><th>Repository</th><th>Status</th><th>Model calls</th><th>Updated</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>${filtered.map((j) => `<tr class="${jobState(j) === "waiting-on-you" ? "row-attention" : ""}"><td><button class="cell-title" data-action="job-detail" data-id="${esc(j.job_id)}">${esc(j.notes?.title || `${kindLabel(j.kind)}${j.number ? ` #${j.number}` : ""}`)}</button><span class="cell-sub">${esc(kindLabel(j.kind))}${j.number ? ` · #${esc(j.number)}` : ""}</span></td><td>${esc(j.repo_full_name || j.repo)}</td><td>${jobBadge(j)}</td><td>${number(j.model_calls_used)}</td><td><span title="${esc(date(j.updated_at || j.created_at))}">${esc(ago(j.updated_at || j.created_at))}</span></td><td><div class="table-actions"><button class="icon-button" data-action="job-detail" data-id="${esc(j.job_id)}" aria-label="Open task details">${icon("chevron")}</button></div></td></tr>`).join("")}</tbody></table></div><div class="table-foot">${filtered.length} of ${all.length} tasks · Select a task to see its results and controls.</div>` : empty("jobs", all.length ? "No matching tasks" : "Your task history starts here", all.length ? "Try a different search or status filter. Waiting on you means a draft needs your decision. Merging stays with you, on GitHub." : "Create a task to fix a pull request or implement an issue. When a pull request is ready, you merge it on GitHub.", all.length ? "" : button("Create a task", "new-task", "plus", "button-primary"))}</section>`;
   }
   function renderRepos() {
     return `${pageHeading("Repositories", "See every watched project. Saved project settings below customize checks for individual tasks.", button("Add repository", "new-repo", "plus", "button-primary"))}${pendingBanner()}${coveragePanel()}${
@@ -602,12 +675,12 @@
     }<div class="spaced-top">${info("Adding a repository lets the worker read authorized commands in its issue and pull request comments. Add a review watch to act automatically on new review feedback. You can use any repository your connected GitHub account can access.")}</div>`;
   }
   function renderWatches() {
-    return `${pageHeading("Review watches", "Your fleet follows all projects listed below. Additional manual review watches remain available.", button("Add review watch", "new-watch", "plus", "button-primary"))}${pendingBanner()}${coveragePanel()}<div class="watch-intro">${icon("watch")}<div><h3>Additional manual review watches</h3><p>Watch one pull request, or all current and future open pull requests in a repository. New review comments can queue coding tasks automatically, within your local worker call controls. Existing comments become the starting point; use New task to fix earlier feedback.</p></div></div><section class="panel">${
+    return `${pageHeading("Review watches", "Your fleet follows all projects listed below. Additional manual review watches remain available.", button("Add review watch", "new-watch", "plus", "button-primary"))}${pendingBanner()}${coveragePanel()}<div class="watch-intro">${icon("watch")}<div><h3>Additional manual review watches</h3><p>Watch one pull request, or all current and future open pull requests in a repository. New review comments can queue coding tasks automatically, within your local worker call controls. Only new inline feedback from allowed command users can queue work. Existing comments become the starting point; use New task to fix earlier feedback. Each pull request allows six automatic tasks per UTC day. The row explains any hold and its reset time.</p></div></div><section class="panel">${
       watches().length
         ? `<div class="table-wrap"><table class="watches-table"><thead><tr><th>Repository</th><th>Watching</th><th>Results folder</th><th>Status</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>${watches()
             .map(
               (w, i) =>
-                `<tr><td>${esc(w.repo || w.repo_full_name)}</td><td>${w.mode === "all" || w.scope === "all" ? `${icon("pr")} All open & new pull requests` : `${icon("pr")} Pull request #${esc(w.number)}`}</td><td>${w.output_dir ? `<span title="${esc(w.output_dir)}">${esc(w.account || "Member folder")}</span><span class="cell-sub mono">${esc(w.output_dir)}</span>` : '<span class="muted">Uses existing worker folder</span>'}</td><td>${badge(w.closed ? "stopped" : A.state.service?.polling_enabled === false ? "paused" : "watching")}</td><td><button class="icon-button" data-action="remove-watch" data-index="${i}" data-watch-key="${esc(`${w.repo || w.repo_full_name}|${w.mode || w.scope || "selected"}|${w.number || ""}`)}" aria-label="Remove review watch">${icon("trash")}</button></td></tr>`,
+                `<tr><td>${esc(w.repo || w.repo_full_name)}</td><td>${w.mode === "all" || w.scope === "all" ? `${icon("pr")} All open & new pull requests` : `${icon("pr")} Pull request #${esc(w.number)}`}</td><td>${w.output_dir ? `<span title="${esc(w.output_dir)}">${esc(w.account || "Member folder")}</span><span class="cell-sub mono">${esc(w.output_dir)}</span>` : '<span class="badge badge-warning">Choose a results folder</span>'}</td><td>${badge(w.health || (w.closed ? "stopped" : "unknown"))}<span class="cell-sub">${esc(w.status_reason || "I do not know whether this watch is ready.")}</span><p class="field-hint">${esc(w.next_step || "Choose Edit watch to review its setup.")}</p>${w.last_success_at ? `<span class="cell-sub">Last successful check: ${esc(date(w.last_success_at))}</span>` : '<span class="cell-sub">No successful check recorded yet.</span>'}${w.next_check_at || w.cap_reset_at ? `<span class="cell-sub">Next check or allowance reset: ${esc(date(w.cap_reset_at || w.next_check_at))}</span>` : ""}</td><td>${watchRecoveryButtons(w)}<button class="icon-button" data-action="remove-watch" data-index="${i}" data-watch-key="${esc(`${w.repo || w.repo_full_name}|${w.mode || w.scope || "selected"}|${w.number || ""}`)}" aria-label="Stop review watch and keep its history">${icon("trash")}</button></td></tr>`,
             )
             .join(
               "",
@@ -628,12 +701,16 @@
 
   const field = (id, label, value, hint = "", type = "text", attrs = "") =>
     `<div class="field"><label for="${esc(id)}">${esc(label)}</label><input id="${esc(id)}" name="${esc(id)}" type="${type}" value="${esc(value)}" ${attrs}>${hint ? `<span class="field-hint">${hint}</span>` : ""}</div>`;
+  function providerSettingsPanel() {
+    const provider = list(A.state.providers).find(p => p.id === "deepseek") || {};
+    return `<section class="panel settings-section"><div class="panel-header"><div><h2>DeepSeek fleet connection</h2><p>Choose which saved connection the DeepSeek fleet uses. Saving a key below selects that connection; existing keys stay saved.</p></div></div><div class="panel-body"><p><strong>Selected connection:</strong> ${esc(provider.credential_source_label || "Not known yet")}</p><p>${esc(provider.next_step || "Store a credential, choose its connection, then restart the worker before testing.")}</p><p class="field-hint">Having a saved credential does not prove the connection works. Testing asks before making one small model request.</p><form id="provider-source-form"><div class="field"><label for="deepseek-source">Connection to use</label><select id="deepseek-source"><option value="env"${provider.credential_source === "env" ? " selected" : ""}>Dedicated DeepSeek key</option><option value="broker-lease"${provider.credential_source === "broker-lease" ? " selected" : ""}>Company broker</option></select></div><div class="heading-actions spaced-top"><button class="button" type="submit">Use this saved connection</button>${button("Store a DeepSeek credential", "store-deepseek", "shield")}${button("Test DeepSeek fleet connection", "recovery-provider-deepseek", "spark")}</div></form><div id="provider-source-status" role="status"></div></div></section>`;
+  }
   function renderSettings() {
     const s = settings(),
       m = model(),
       service = A.state.service || {};
-    return `${pageHeading("Settings", "Make the worker fit your repositories, model, and way of working.")}${pendingBanner()}${fleetSettingsPanel()}<form id="settings-form" data-revision="${esc(A.state.config_revision)}"><div class="settings-layout"><nav class="settings-nav" aria-label="Settings sections"><a href="#settings" data-scroll="connections">Connections</a><a href="#settings" data-scroll="worker-controls">Worker controls</a><a href="#settings" data-scroll="model-limits">Model & limits</a><a href="#settings" data-scroll="command-settings">GitHub commands</a><a href="#settings" data-scroll="advanced-settings">Advanced</a></nav><div>
-      <section class="panel settings-section" id="connections"><div class="panel-header"><div><h2>Connections for individual tasks</h2><p>The fleet pools and their live status appear above. These settings control the model used for individually queued tasks.</p></div></div><div class="panel-body"><div class="status-row" style="padding-top:0"><span>${icon("github")}GitHub account</span><strong>${esc(A.state.github?.login || "Not connected")}</strong></div><div class="heading-actions spaced-top">${button(A.state.github?.configured ? "Reconnect GitHub" : "Connect GitHub", "github-connect", "external", "button-small")}${button("Run setup checks", "diagnostics", "check-circle", "button-small")}${button("Test model connection", "provider-check", "spark", "button-small")}</div><hr class="field-divider"><div class="field-grid">${field("model_id", "Model name", m.model_id, "The exact model ID supported by your provider.", "text", 'required autocomplete="off"')}${field("base_url", "Model server address", m.base_url, "OpenAI-compatible base URL; omit the final <code>/chat/completions</code> path.", "url", "required")}<div class="field"><label for="auth_mode">Credential source</label><select name="auth_mode" id="auth_mode"><option value="broker-lease"${m.auth_mode === "broker-lease" ? " selected" : ""}>Company secret broker</option><option value="env"${m.auth_mode === "env" ? " selected" : ""}>Dedicated provider API key</option></select><span class="field-hint">Choose where the worker gets its model credentials.</span></div><div class="field"><label>Update a credential</label>${button("Store a new credential", "store-credential", "shield", "")}<span class="field-hint">Write-only: a saved key is never displayed in the browser.</span></div></div><div class="spaced-top">${info("Setup checks make no model request. Test model connection asks before sending exactly one small model request. Save connection changes and restart before testing them.")}</div></div></section>
+    return `${pageHeading("Settings", "Make the worker fit your repositories, model, and way of working.")}${pendingBanner()}${fleetSettingsPanel()}${providerSettingsPanel()}<form id="settings-form" data-revision="${esc(A.state.config_revision)}"><div class="settings-layout"><nav class="settings-nav" aria-label="Settings sections"><a href="#settings" data-scroll="connections">Connections</a><a href="#settings" data-scroll="worker-controls">Worker controls</a><a href="#settings" data-scroll="model-limits">Model & limits</a><a href="#settings" data-scroll="command-settings">GitHub commands</a><a href="#settings" data-scroll="advanced-settings">Advanced</a></nav><div>
+      <section class="panel settings-section" id="connections"><div class="panel-header"><div><h2>Model connections</h2><p>The model fields below are shared by individual tasks and the GLM fleet. The GLM fleet requires the model name glm-5.3-flash. Choosing another model here makes that pool unavailable until you restore it. DeepSeek has its own connection choice above.</p></div></div><div class="panel-body"><div class="status-row" style="padding-top:0"><span>${icon("github")}GitHub account</span><strong>${esc(A.state.github?.login || "Not connected")}</strong></div><div class="heading-actions spaced-top">${button(A.state.github?.configured ? "Reconnect GitHub" : "Connect GitHub", "github-connect", "external", "button-small")}${button("Run setup checks", "diagnostics", "check-circle", "button-small")}${button("Test individual-task model", "provider-check", "spark", "button-small")}${button("Test GLM fleet connection", "recovery-provider-glm", "spark", "button-small")}${button("Test DeepSeek fleet connection", "recovery-provider-deepseek", "spark", "button-small")}</div><hr class="field-divider"><div class="field-grid">${field("model_id", "Model name", m.model_id, "The exact model ID supported by your provider.", "text", 'required autocomplete="off"')}${field("base_url", "Model server address", m.base_url, "OpenAI-compatible base URL; omit the final <code>/chat/completions</code> path.", "url", "required")}<div class="field"><label for="auth_mode">Credential source</label><select name="auth_mode" id="auth_mode"><option value="broker-lease"${m.auth_mode === "broker-lease" ? " selected" : ""}>Company secret broker</option><option value="env"${m.auth_mode === "env" ? " selected" : ""}>Dedicated provider API key</option></select><span class="field-hint">Choose where the worker gets its model credentials.</span></div><div class="field"><label>Update a credential</label>${button("Store a new credential", "store-credential", "shield", "")}<span class="field-hint">Write-only: a saved key is never displayed in the browser.</span></div></div><div class="spaced-top">${info("Setup checks make no model request. Test model connection asks before sending exactly one small model request. Save connection changes and restart before testing them.")}</div></div></section>
       <section class="panel settings-section" id="worker-controls"><div class="panel-header"><div><h2>Individual-task worker controls</h2><p>FatChin checks GitHub regularly for new commands and review feedback; this is called polling. Queued tasks run separately.</p></div>${badge(service.active ? "running" : "stopped")}</div><div class="panel-body"><div class="heading-actions">${service.active ? `${button(service.polling_enabled === false ? "Resume polling" : "Pause polling", service.polling_enabled === false ? "service-resume" : "service-pause", service.polling_enabled === false ? "play" : "pause")}${button("Restart worker", "service-restart", "refresh")}${button("Stop worker", "service-stop", "stop", "button-danger")}` : button("Start worker", "service-start", "play", "button-primary")}</div><p class="field-hint spaced-top">Pause polling takes effect on the next check; queued tasks continue. Stop and restart require an idle worker. Use Tasks to stop queued or running tasks, then wait for the current step to finish.</p><div class="field-grid spaced-top">${field("poll_interval_seconds", "Check for updates every (seconds)", s.poll_interval_seconds, "A lower value checks GitHub more often.", "number", 'min="5" step="1" required')}<div class="field"><label for="poll_repos">Polling after restart</label><select name="poll_repos" id="poll_repos"><option value="true"${s.poll_repos !== false ? " selected" : ""}>Enabled</option><option value="false"${s.poll_repos === false ? " selected" : ""}>Disabled</option></select><span class="field-hint">The saved starting preference for the worker.</span></div></div></div></section>
       <section class="panel settings-section" id="model-limits"><div class="panel-header"><div><h2>Individual-task call limits</h2><p>Worker controls are separate from your provider’s subscription allowance.</p></div></div><div class="panel-body"><div class="field-grid">${field("max_calls_per_job", "Maximum calls per task (local)", m.max_calls_per_job, "A task stops requesting more calls when this limit is reached.", "number", 'min="1" step="1" required')}${field("max_calls_per_day", "Maximum calls per day (local)", m.max_calls_per_day, "Shared across tasks. The worker uses its UTC day boundary.", "number", 'min="1" step="1" required')}${field("max_tokens", "Maximum response tokens", m.max_tokens, "Limits the length of each model response. A token is a small piece of text.", "number", 'min="1" step="1" required')}${field("max_tool_iterations", "Maximum coding steps per task", s.max_tool_iterations, "Each step may read files, edit code, or run commands.", "number", 'min="1" step="1" required')}</div><div class="spaced-top">${info("These local worker controls count logical model calls; they do not describe your provider’s subscription allowance. A call can retry transport failures up to three HTTP attempts. Automatic review watches share the same local controls.")}</div></div></section>
       <section class="panel settings-section" id="command-settings"><div class="panel-header"><div><h2>GitHub comment commands</h2><p>Start and manage work directly from an issue or pull request.</p></div></div><div class="panel-body"><div class="field-grid">${field("command_prefix", "Command prefix", s.command_prefix, "Example: <code>/agent fix</code> on a pull request.", "text", "required")}<div class="field"><label for="command-user-lookup">Add a GitHub command user</label><div class="input-action"><input id="command-user-lookup" placeholder="GitHub username" autocomplete="off"><button id="command-user-add" type="button" class="button">${icon("plus")}Add user</button></div><div class="heading-actions">${button("Add connected account", "add-connected-user", "github", "button-small")}</div><span class="field-hint">Choose who can start work through GitHub comments. The company workspace itself remains available through the company network.</span><div id="command-user-feedback" class="field-hint" aria-live="polite"></div><div id="command-user-list" class="command-users" aria-label="Allowed GitHub comment users"></div></div><div class="field field-full"><details><summary>Advanced: allowed GitHub user IDs</summary><div><label for="allowed_command_users" class="field-label">One numeric GitHub user ID per line</label><textarea name="allowed_command_users" id="allowed_command_users" rows="3" placeholder="No comment command users configured">${esc(list(s.allowed_command_users).join("\n"))}</textarea><p class="field-hint">Username lookup adds the permanent account ID here. You can edit this list to remove users or import IDs. Save and restart to apply.</p></div></details></div></div></div></section>
@@ -643,7 +720,7 @@
 
   function renderHelp() {
     const prefix = settings().command_prefix || "/agent";
-    return `${pageHeading("A little guidance. A lot of progress.", "Everything you need to start, follow, and finish your work.")}<div class="help-layout"><div><section class="help-card"><h2>Understand the words, then choose a goal</h2><details open><summary>GitHub words in everyday English</summary><div><p><strong>Repository</strong>: a project and its saved history. <strong>Branch</strong>: a separate line of work. <strong>Commit</strong>: a saved set of changes. <strong>Pull request</strong>: a proposed branch change for review. <strong>Issue</strong>: a description of a problem or piece of work. <strong>Check</strong>: a command or test used to verify a change. <strong>Draft</strong>: a proposal waiting for your decision.</p></div></details><details><summary>Explore a project or learn Git without a terminal</summary><div><p>Open <a href="#learn">Explore &amp; learn</a>. Browse a project’s files, saved changes and branch comparisons. Other useful views explains which outside tool answers which question and when it can be used.</p><p>Choose Learn step by step for Guide me or Show me. Read an explanation, perform one move, inspect the result, then choose Next move. Git basics changes only a disposable practice project. Export before ending if you want to keep the transcript.</p><p><a href="/docs/EXPLORE-AND-LEARN.md" target="_blank" rel="noopener noreferrer">Read the exploration and learning guide.</a></p></div></details><h2>Start with a familiar workflow</h2><details open><summary>Keep your GitHub projects reviewed and corrected</summary><div><ol><li><strong>Open <a href="#fleet">Agent fleet</a>.</strong> If it is running, follow the existing work. Use Resume fleet if paused or stopped; no duplicate dispatch or agent reset is needed.</li><li><strong>For a first dispatch, choose your member account and reports folder.</strong> Browse folders shows the server’s folders. Reuse your saved destination; reopening restores it. Leave All accessible writable repositories selected to include the whole connected account, or choose several projects.</li><li><strong>Choose the two pools.</strong> Defaults are 10 GLM and 10 DeepSeek agents. Dispatch 20 agents authorizes reviews, specific corrections and correction pull requests in that scope. You retain the merge decision.</li></ol><p>At most <strong>four agents work in one repository</strong>, across both pools and all task types. Twenty busy agents therefore span at least five repositories. Every task gets a fresh worker and conversation, then that worker retires. Code changes use a separate isolated working copy and correction branch.</p><p><a href="/docs/WORKFLOW.md" target="_blank" rel="noopener noreferrer">Follow the complete push-to-merge walkthrough.</a></p></div></details><details><summary>Follow a push through review, correction and merge readiness</summary><div><p>New remote work is discovered on periodic scans. Actionable comments come first, then newest-created pull requests, then eligible background code reviews. The current assignment finishes before an agent takes the next one.</p><ol><li>A fresh agent reviews the change and records supported findings.</li><li>Another fresh agent fixes the specific finding and runs the project’s checks.</li><li>The published correction goes immediately to a different agent’s review queue.</li><li>Current reviewed changes that satisfy checks, approvals and merge requirements appear in <strong>Ready to merge</strong>. Click through to GitHub, merge there, then use Delete branch if appropriate.</li></ol><p>Further findings update the same correction branch. After three automatic repair rounds the item waits for a person. All agents use one GitHub identity; another worker cannot supply another person’s required approval.</p></div></details><details><summary>Find all repositories, comments and merge-ready requests</summary><div><p><strong>Repositories</strong> and <strong>Review watches</strong> show every discovered fleet project with search. The smaller lists of saved individual-task projects and manual watches are separate; you do not need to add hundreds of repositories yourself.</p><p><strong>Agents &amp; queue</strong> shows assignments. <strong>Open comments</strong> links source feedback, corrections and independent reviews. <strong>Ready to merge</strong> links eligible requests. <strong>Activity</strong> records handoffs and recovery. Recent fleet tasks in Tasks open their matching evidence; Settings has controls for both pools.</p></div></details><details><summary>Choose one individual task instead</summary><div><p>Use <strong>New task</strong> for one of the twelve task types. These use saved individual-task repository settings. If the project is missing, add it in Repositories with its base branch and check commands, then apply the configuration while the shared worker is idle.</p><p>Choose a target, your account and a results folder, read the final review, then queue the task. Draft-producing tasks use <strong>Waiting on you → Post / Edit / Discard</strong>. The fleet dispatch separately authorizes its automatic cycle; it does not wait for Post on every correction.</p></div></details><details><summary>Fix review feedback on a pull request</summary><div><p>Select <strong>New task → Fix a pull request</strong>. Choose a configured repository and an open pull request, then a folder you own. The worker reads its review history, edits an isolated checkout, runs configured checks, and pushes verified changes to the pull request. It can reply to and resolve review threads when the correction is supported by checks and the feedback has not changed.</p><p>Fixing an existing pull request can push commits and post comments on GitHub. Review the final step before you queue the task.</p></div></details><details><summary>Turn an issue into an implementation</summary><div><p>Select <strong>New task → Implement an issue</strong>. Choose an issue, then a results folder. The worker uses the repository’s configured base branch, creates a separate checkout, writes and verifies changes, and can open a pull request with its results.</p><p>Give the issue a clear problem, expected behavior, and acceptance criteria. Better source information helps the worker produce useful changes.</p></div></details><details><summary>Add a manual watch for future review comments</summary><div><p>Open <strong>Review watches → Add review watch</strong>. Select one pull request or all open and future pull requests in a configured repository. Choose an account and folder for automatic results, then confirm the model usage and GitHub side effects.</p><p>The first check records existing comments as its starting point. Later feedback can queue work automatically. Use New task to address feedback that already existed when you created the watch. Closed pull requests do not receive automatic follow-up. Remove a manual watch to stop its future submissions; queued tasks remain. This does not remove the project from an account-wide fleet. Change fleet scope separately.</p></div></details><details><summary>Choose a folder and find your results</summary><div><p>Choose your own account, then <strong>Browse folders</strong>. Navigate with folder rows or the parent button. Use <strong>New folder</strong> to explicitly create a folder, then <strong>Use this folder</strong>. The worker checks that the folder belongs to your account and is writable before accepting work.</p><p>Task details show the selected destination, result summary, checks, changed files, and recorded errors. Use <strong>Browse task files</strong> to inspect available files or <strong>Download report</strong> to save the task’s JSON record. Temporary checkouts are working files; your selected folder is the results destination.</p></div></details><details><summary>Control individual tasks and the shared service</summary><div><p><strong>Pause polling</strong> stops individual-task discovery on the next update check; tasks already queued continue. Use the separate fleet controls for account-wide work. <strong>Stop worker</strong> stops an idle service. <strong>Restart worker</strong> applies saved settings when the worker is idle. Stop queued or running tasks first and wait for the current step to finish.</p><p><strong>Stop task</strong> requests a graceful stop of that task. An in-progress command or model request may finish before the worker observes it. Already pushed GitHub changes are kept. <strong>Retry task</strong> queues a fresh attempt using the task’s repository and destination; it may use more model calls and may write to GitHub again. Only terminal tasks offer Retry.</p></div></details><details><summary>Use commands directly on GitHub</summary><div><p>In a configured repository, an allowed GitHub user can comment:</p><ul><li><code>${esc(prefix)} implement</code> on an issue to implement it.</li><li><code>${esc(prefix)} fix</code> on a pull request to address review feedback.</li><li><code>${esc(prefix)} status</code> to ask for task status.</li><li><code>${esc(prefix)} stop</code> to request a task stop.</li></ul><p>The saved command user IDs control who may start work from GitHub comments. The graphical workspace uses the same worker and queue.</p></div></details></section><section class="help-card"><h2>When something needs attention</h2><details><summary>A fleet item is waiting, failed a check or needs recovery</summary><div><p>Worker exits and stalls recover automatically. Provider and GitHub rate limits wait through a cooldown. A missing or failed project check remains visible on that item.</p><p>Choose <strong>Set verification command</strong>, enter the project’s documented test or build command, then <strong>Save and continue</strong>. Waiting work is reconsidered automatically, without a worker reset. For a fork PR this updates the source fork’s settings. Expand <strong>Verification failed — read the command output</strong> for an actual failure; choose <strong>Retry this item</strong> after addressing its cause.</p><p>A code correction needs passing local checks on its proposed version. Missing permissions, moved branches, required approvals and automation expense holds require attention; retrying does not bypass them.</p></div></details><details><summary>Pause the fleet or change its scope without losing history</summary><div><p><strong>Pause after current tasks</strong> stops new assignments and lets current work finish. <strong>Resume fleet</strong> allows assignments again. <strong>Stop now</strong> prevents new write admission and requests cancellation; a write already admitted or sent may still finish. Closing this browser does not stop the fleet.</p><p>To change pools, repositories or destination, stop the fleet, wait for workers to finish stopping, then dispatch the replacement setup. History stays. These controls are available in Agent fleet and Settings.</p></div></details><details><summary>A task failed, stopped, or reached a limit</summary><div><p>Open the task in Tasks. Read its recorded error and verification output before retrying. A failed verification is a real failure; it is not presented as a successful result. If model calls reached a limit, review usage in Settings before increasing it. Retry only when the cause is addressed.</p></div></details><details><summary>A repository, branch, issue, or pull request is missing</summary><div><p>Check GitHub access in Settings. Repository searches show repositories accessible to the connected account. Fleet coverage appears in Repositories and Review watches after discovery; check its selected scope and scan status. Individual New task jobs require saved project settings before submission. Target lists show open issues or pull requests; you can enter a known number to look it up. Branches must exist in the selected repository.</p></div></details><details><summary>Changes are saved but the worker has not changed</summary><div><p>Changes to ordinary repository and model settings require a worker restart. Fleet Set verification command → Save and continue takes effect without an agent reset. The yellow banner remains until the running service has loaded them. A restart requires an idle worker; stop queued or running tasks first and wait for the current step to finish. Pause polling is a separate control and takes effect without a configuration restart.</p><p>If another browser saved settings while you were editing, the server refuses a stale save. Reload the latest settings, review them, and reapply your changes.</p></div></details><details><summary>GitHub writes are held or rules cannot be checked</summary><div><p>Before writing to GitHub, the worker checks repository workflows and rules that might trigger paid services. When it cannot verify that a write is allowed, it holds the write and records why. A repository’s advanced option can allow an unknown ruleset only when the GitHub plan prevents checking it. Review that exception carefully; it is not a general bypass.</p></div></details><details><summary>A folder cannot be used</summary><div><p>Choose your account, then a folder inside your home space. Use New folder in the browser if needed. If FatChin cannot write there, choose another folder or ask the owner to grant access. The worker never silently redirects results to a shared destination.</p></div></details></section></div><aside><section class="help-card"><h2>Is everything ready?</h2><div class="help-block"><h3>Check the connections first</h3><p>Verify GitHub, configuration, storage, and the worker without starting a coding task.</p><div class="spaced-top">${button("Run setup checks", "diagnostics", "check-circle", "button-small")}</div></div><div class="help-block"><h3>Understand model usage</h3><p>The worker’s local controls count logical model calls and are separate from your provider’s subscription allowance. A call can retry a transport failure up to three HTTP attempts. Manual watches share those local per-task and daily controls. The fleet has separate counters and bounded tasks; an individual-worker daily limit does not pause it. Each pool still follows its selected provider’s subscription and service limits.</p></div><div class="help-block"><h3>Private company workspace</h3><p>This interface is available through the company network. GitHub access and model credentials belong to the shared worker. Results go to the member’s chosen folder.</p></div></section><section class="help-card"><h2>Workspace documentation</h2><div class="help-block"><p><a href="/docs/WORKFLOW.md" target="_blank" rel="noopener noreferrer">Push-to-merge walkthrough</a> · Start the fleet, follow each stage and resolve waiting work.</p><p><a href="/docs/AGENT-FLEET.md" target="_blank" rel="noopener noreferrer">Agent fleet guide</a> · Both pools, priorities, four-agent repository limit and recovery.</p><p><a href="/docs/GUI-GUIDE.md" target="_blank" rel="noopener noreferrer">User guide</a> · Complete task, repository, and review workflows.</p><p><a href="/docs/GUI-OPERATIONS.md" target="_blank" rel="noopener noreferrer">Operations guide</a> · Setup, services, backups, and recovery.</p><p><a href="/docs/GUI-CAPABILITIES.md" target="_blank" rel="noopener noreferrer">Capability reference</a> · Every control and its real behavior.</p><p><a href="/docs/GUI-ACCEPTANCE.md" target="_blank" rel="noopener noreferrer">Acceptance checklist</a> · What is tested and how to verify it.</p></div></section><section class="help-card"><h2>Keyboard shortcuts</h2><div class="help-block"><div class="shortcut"><span>New task</span><span><kbd>Alt</kbd> + <kbd>N</kbd></span></div><div class="shortcut"><span>Refresh workspace</span><span><kbd>Alt</kbd> + <kbd>R</kbd></span></div><div class="shortcut"><span>Close dialog</span><kbd>Esc</kbd></div><div class="shortcut"><span>Move through controls</span><kbd>Tab</kbd></div><div class="shortcut"><span>Activate a control</span><kbd>Enter</kbd></div></div></section><section class="help-card"><h2>Task stages</h2><div class="help-block"><p><strong>Queued</strong> — waiting its turn.</p><p><strong>Retrieving</strong> — reading GitHub context.</p><p><strong>Working</strong> — coding in a separate checkout.</p><p><strong>Verifying</strong> — running the repository checks.</p><p><strong>Responding</strong> — publishing supported results.</p><p><strong>Done</strong> — finished successfully.</p><p><strong>Failed / Stopped</strong> — inspect the recorded details before retrying.</p></div></section></aside></div>`;
+    return `${pageHeading("A little guidance. A lot of progress.", "Everything you need to start, follow, and finish your work.")}<div class="help-layout"><div><section class="help-card"><h2>Understand the words, then choose a goal</h2><details open><summary>GitHub words in everyday English</summary><div><p><strong>Repository</strong>: a project and its saved history. <strong>Branch</strong>: a separate line of work. <strong>Commit</strong>: a saved set of changes. <strong>Pull request</strong>: a proposed branch change for review. <strong>Issue</strong>: a description of a problem or piece of work. <strong>Check</strong>: a command or test used to verify a change. <strong>Draft</strong>: a proposal waiting for your decision.</p></div></details><details><summary>Explore a project or learn Git without a terminal</summary><div><p>Open <a href="#learn">Explore &amp; learn</a>. Browse a project’s files, saved changes and branch comparisons. Other useful views explains which outside tool answers which question and when it can be used.</p><p>Choose Learn step by step for Guide me or Show me. Read an explanation, perform one move, inspect the result, then choose Next move. Git basics changes only a disposable practice project. Export before ending if you want to keep the transcript.</p><p><a href="/docs/EXPLORE-AND-LEARN.md" target="_blank" rel="noopener noreferrer">Read the exploration and learning guide.</a></p></div></details><h2>Start with a familiar workflow</h2><details open><summary>Keep your GitHub projects reviewed and corrected</summary><div><ol><li><strong>Open <a href="#fleet">Agent fleet</a>.</strong> If it is running, follow the existing work. Use Resume fleet if paused or stopped; no duplicate dispatch or agent reset is needed.</li><li><strong>For a first dispatch, choose your member account and reports folder.</strong> Browse folders shows the server’s folders. Reuse your saved destination; reopening restores it. Leave All accessible writable repositories selected to include the whole connected account, or choose several projects.</li><li><strong>Choose the two pools.</strong> Defaults are 10 GLM and 10 DeepSeek agents. Dispatch 20 agents authorizes reviews, specific corrections and correction pull requests in that scope. You retain the merge decision.</li></ol><p>At most <strong>four agents work in one repository</strong>, across both pools and all task types. Twenty busy agents therefore span at least five repositories. Every task gets a fresh worker and conversation, then that worker retires. Code changes use a separate isolated working copy and correction branch.</p><p><a href="/docs/WORKFLOW.md" target="_blank" rel="noopener noreferrer">Follow the complete push-to-merge walkthrough.</a></p></div></details><details><summary>Follow a push through review, correction and merge readiness</summary><div><p>New remote work is discovered on periodic scans. Actionable comments come first, then newest-created pull requests, then eligible background code reviews. The current assignment finishes before an agent takes the next one.</p><ol><li>A fresh agent reviews the change and records supported findings.</li><li>Another fresh agent fixes the specific finding and runs the project’s checks.</li><li>The published correction goes immediately to a different agent’s review queue.</li><li>Current reviewed changes that satisfy checks, approvals and merge requirements appear in <strong>Ready to merge</strong>. Click through to GitHub, merge there, then use Delete branch if appropriate.</li></ol><p>Further findings update the same correction branch. After three automatic repair rounds the item waits for a person. All agents use one GitHub identity; another worker cannot supply another person’s required approval.</p></div></details><details><summary>Find all repositories, comments and merge-ready requests</summary><div><p><strong>Repositories</strong> and <strong>Review watches</strong> show every discovered fleet project with search. The smaller lists of saved individual-task projects and manual watches are separate; you do not need to add hundreds of repositories yourself.</p><p><strong>Agents &amp; queue</strong> shows assignments. <strong>Open comments</strong> links source feedback, corrections and independent reviews. <strong>Ready to merge</strong> links eligible requests. <strong>Activity</strong> records handoffs and recovery. Recent fleet tasks in Tasks open their matching evidence; Settings has controls for both pools.</p></div></details><details><summary>Choose one individual task instead</summary><div><p>Use <strong>New task</strong> for one of the twelve task types. These use saved individual-task repository settings. If the project is missing, add it in Repositories with its base branch and check commands, then apply the configuration while the shared worker is idle.</p><p>Choose a target, your account and a results folder, read the final review, then queue the task. Draft-producing tasks use <strong>Waiting on you → Post / Edit / Discard</strong>. The fleet dispatch separately authorizes its automatic cycle; it does not wait for Post on every correction.</p></div></details><details><summary>Fix review feedback on a pull request</summary><div><p>Select <strong>New task → Fix a pull request</strong>. Choose a configured repository and an open pull request, then a folder you own. The worker reads its review history, edits an isolated checkout, runs configured checks, and pushes verified changes to the pull request. It can reply to and resolve review threads when the correction is supported by checks and the feedback has not changed.</p><p>Fixing an existing pull request can push commits and post comments on GitHub. Review the final step before you queue the task.</p></div></details><details><summary>Turn an issue into an implementation</summary><div><p>Select <strong>New task → Implement an issue</strong>. Choose an issue, then a results folder. The worker uses the repository’s configured base branch, creates a separate checkout, writes and verifies changes, and can open a pull request with its results.</p><p>Give the issue a clear problem, expected behavior, and acceptance criteria. Better source information helps the worker produce useful changes.</p></div></details><details><summary>Add a manual watch for future review comments</summary><div><p>Open <strong>Review watches → Add review watch</strong>. Select one pull request or all open and future pull requests in a configured repository. Choose an account and folder for automatic results, then confirm the model usage and GitHub side effects.</p><p>The first check records existing comments as its starting point. Later feedback can queue work automatically. Use New task to address feedback that already existed when you created the watch. Closed pull requests do not receive automatic follow-up. Remove a manual watch to stop its future submissions; queued tasks remain. This does not remove the project from an account-wide fleet. Change fleet scope separately.</p></div></details><details><summary>Choose a folder and find your results</summary><div><p>Choose your own account, then <strong>Browse folders</strong>. Navigate with folder rows or the parent button. Use <strong>New folder</strong> to explicitly create a folder, then <strong>Use this folder</strong>. The worker checks that the folder belongs to your account and is writable before accepting work.</p><p>Task details show the selected destination, result summary, checks, changed files, and recorded errors. Use <strong>Browse task files</strong> to inspect available files or <strong>Download report</strong> to save the task’s JSON record. Temporary checkouts are working files; your selected folder is the results destination.</p></div></details><details><summary>Control individual tasks and the shared service</summary><div><p><strong>Pause polling</strong> stops individual-task discovery on the next update check; tasks already queued continue. Use the separate fleet controls for account-wide work. <strong>Stop worker</strong> stops an idle service. <strong>Restart worker</strong> applies saved settings when the worker is idle. Stop queued or running tasks first and wait for the current step to finish.</p><p><strong>Stop task</strong> requests a graceful stop of that task. An in-progress command or model request may finish before the worker observes it. Already pushed GitHub changes are kept. <strong>Retry task</strong> queues a fresh attempt using the task’s repository and destination; it may use more model calls and may write to GitHub again. Only terminal tasks offer Retry.</p></div></details><details><summary>Use commands directly on GitHub</summary><div><p>In a configured repository, an allowed GitHub user can comment:</p><ul><li><code>${esc(prefix)} implement</code> on an issue to implement it.</li><li><code>${esc(prefix)} fix</code> on a pull request to address review feedback.</li><li><code>${esc(prefix)} status</code> to ask for task status.</li><li><code>${esc(prefix)} stop</code> to request a task stop.</li></ul><p>The saved command user IDs control who may start work from GitHub comments. The graphical workspace uses the same worker and queue.</p></div></details></section><section class="help-card"><h2>When something needs attention</h2><details><summary>A fleet item is waiting, failed a check or needs recovery</summary><div><p>Worker exits and stalls recover automatically. Provider and GitHub rate limits wait through a cooldown. A missing or failed project check remains visible on that item.</p><p>Choose <strong>Set verification command</strong>, enter the project’s documented test or build command, then <strong>Save check commands</strong>. A running fleet reconsiders waiting work automatically. A stopped or paused fleet stays that way; choose <strong>Review resuming fleet</strong> after saving, then confirm when you want work to continue. No worker reset is needed to apply these check commands. For a fork PR this updates the source fork’s settings. Expand <strong>Verification failed — read the command output</strong> for an actual failure; choose <strong>Retry this item</strong> after addressing its cause.</p><p>A code correction needs passing local checks on its proposed version. Missing permissions, moved branches, required approvals and automation expense holds require attention; retrying does not bypass them.</p></div></details><details><summary>Pause the fleet or change its scope without losing history</summary><div><p><strong>Pause after current tasks</strong> stops new assignments and lets current work finish. <strong>Resume fleet</strong> allows assignments again. <strong>Stop now</strong> prevents new write admission and requests cancellation; a write already admitted or sent may still finish. Closing this browser does not stop the fleet.</p><p>To change pools, repositories or destination, stop the fleet, wait for workers to finish stopping, then dispatch the replacement setup. History stays. These controls are available in Agent fleet and Settings.</p></div></details><details><summary>A task failed, stopped, or reached a limit</summary><div><p>Open the task in Tasks. Read its recorded error and verification output before retrying. A failed verification is a real failure; it is not presented as a successful result. If model calls reached a limit, review usage in Settings before increasing it. Retry only when the cause is addressed.</p></div></details><details><summary>A repository, branch, issue, or pull request is missing</summary><div><p>Check GitHub access in Settings. Repository searches show repositories accessible to the connected account. Fleet coverage appears in Repositories and Review watches after discovery; check its selected scope and scan status. Individual New task jobs require saved project settings before submission. Target lists show open issues or pull requests; you can enter a known number to look it up. Branches must exist in the selected repository.</p></div></details><details><summary>Changes are saved but the worker has not changed</summary><div><p>Changes to ordinary repository and model settings require a worker restart. Fleet Set verification command → Save check commands applies the check commands without an agent reset. If that fleet is stopped or paused, use Review resuming fleet and confirm to continue its work. The yellow banner remains until the running service has loaded them. A restart requires an idle worker; stop queued or running tasks first and wait for the current step to finish. Pause polling is a separate control and takes effect without a configuration restart.</p><p>If another browser saved settings while you were editing, the server refuses a stale save. Reload the latest settings, review them, and reapply your changes.</p></div></details><details><summary>GitHub writes are held or rules cannot be checked</summary><div><p>Before writing to GitHub, the worker checks repository workflows and rules that might trigger paid services. When it cannot verify that a write is allowed, it holds the write and records why. A repository’s advanced option can allow an unknown ruleset only when the GitHub plan prevents checking it. Review that exception carefully; it is not a general bypass.</p></div></details><details><summary>A folder cannot be used</summary><div><p>Choose your account, then a folder inside your home space. Use New folder in the browser if needed. If FatChin cannot write there, choose another folder or ask the owner to grant access. The worker never silently redirects results to a shared destination.</p></div></details></section></div><aside><section class="help-card"><h2>Is everything ready?</h2><div class="help-block"><h3>Check the connections first</h3><p>Verify GitHub, configuration, storage, and the worker without starting a coding task.</p><div class="spaced-top">${button("Run setup checks", "diagnostics", "check-circle", "button-small")}</div></div><div class="help-block"><h3>Understand model usage</h3><p>The worker’s local controls count logical model calls and are separate from your provider’s subscription allowance. A call can retry a transport failure up to three HTTP attempts. Manual watches share those local per-task and daily controls. The fleet has separate counters and bounded tasks; an individual-worker daily limit does not pause it. Each pool still follows its selected provider’s subscription and service limits.</p></div><div class="help-block"><h3>Private company workspace</h3><p>This interface is available through the company network. GitHub access and model credentials belong to the shared worker. Results go to the member’s chosen folder.</p></div></section><section class="help-card"><h2>Workspace documentation</h2><div class="help-block"><p><a href="/docs/WORKFLOW.md" target="_blank" rel="noopener noreferrer">Push-to-merge walkthrough</a> · Start the fleet, follow each stage and resolve waiting work.</p><p><a href="/docs/AGENT-FLEET.md" target="_blank" rel="noopener noreferrer">Agent fleet guide</a> · Both pools, priorities, four-agent repository limit and recovery.</p><p><a href="/docs/GUI-GUIDE.md" target="_blank" rel="noopener noreferrer">User guide</a> · Complete task, repository, and review workflows.</p><p><a href="/docs/GUI-OPERATIONS.md" target="_blank" rel="noopener noreferrer">Operations guide</a> · Setup, services, backups, and recovery.</p><p><a href="/docs/GUI-CAPABILITIES.md" target="_blank" rel="noopener noreferrer">Capability reference</a> · Every control and its real behavior.</p><p><a href="/docs/GUI-ACCEPTANCE.md" target="_blank" rel="noopener noreferrer">Acceptance checklist</a> · What is tested and how to verify it.</p></div></section><section class="help-card"><h2>Keyboard shortcuts</h2><div class="help-block"><div class="shortcut"><span>New task</span><span><kbd>Alt</kbd> + <kbd>N</kbd></span></div><div class="shortcut"><span>Refresh workspace</span><span><kbd>Alt</kbd> + <kbd>R</kbd></span></div><div class="shortcut"><span>Close dialog</span><kbd>Esc</kbd></div><div class="shortcut"><span>Move through controls</span><kbd>Tab</kbd></div><div class="shortcut"><span>Activate a control</span><kbd>Enter</kbd></div></div></section><section class="help-card"><h2>Task stages</h2><div class="help-block"><p><strong>Queued</strong> — waiting its turn.</p><p><strong>Retrieving</strong> — reading GitHub context.</p><p><strong>Working</strong> — coding in a separate checkout.</p><p><strong>Verifying</strong> — running the repository checks.</p><p><strong>Responding</strong> — publishing supported results.</p><p><strong>Done</strong> — finished successfully.</p><p><strong>Failed / Stopped</strong> — inspect the recorded details before retrying.</p></div></section></aside></div>`;
   }
   function doorbellSentence(entry, fallback) {
     if (entry.text) return entry.text;
@@ -655,24 +732,25 @@
     const where = entry.repo
       ? `${esc(entry.repo)}${entry.number && entry.number !== "*" ? ` #${esc(entry.number)}` : ""}`
       : esc(kindLabel(entry.task));
-    return `<div class="doorbell-row"><span class="doorbell-icon">${icon(iconName)}</span><div><p>${esc(sentence)}</p><small>${where} · ${esc(ago(entry.at || entry.updated_at))}</small></div><div class="doorbell-meta">${entry.fleet_item ? `<a class="button button-small" href="#fleet">Open fleet</a>` : ""}${job ? `<button class="icon-button" data-action="job-detail" data-id="${esc(job.job_id)}" aria-label="Open task details">${icon("chevron")}</button>` : ""}</div></div>`;
+    return `<div class="doorbell-row"><span class="doorbell-icon">${icon(iconName)}</span><div><p>${esc(sentence)}</p><small>${where} · ${esc(ago(entry.at || entry.updated_at))}</small></div><div class="doorbell-meta">${entry.fleet_item ? button("Open this work item", "fleet-open-item", "arrow", "button-small", `data-id="${esc(entry.item_id)}"`) : ""}${job ? `<button class="icon-button" data-action="job-detail" data-id="${esc(job.job_id)}" aria-label="Open task details">${icon("chevron")}</button>` : ""}</div></div>`;
   }
   function draftRow(job) {
+    if(job.notes?.posting || job.notes?.phase === "posting-unconfirmed") return `<div class="doorbell-row"><div><p>This draft’s earlier publication is not confirmed.</p><p>Open the saved task to check GitHub or record what you found. Nothing will be sent again automatically.</p>${button("Check this publishing decision", "job-detail", "shield", "button-small", `data-id="${esc(job.job_id)}"`)}</div></div>`;
     const note = `draft-note-${job.job_id}`;
     const title = job.notes?.title || `${kindLabel(job.kind)} #${job.number}`;
     const sentence = `A draft for ${job.repo_full_name || job.repo}${job.number ? ` #${job.number}` : ""} is ready for your decision.`;
     return `<div class="doorbell-row draft-row"><span class="doorbell-icon">${icon("edit")}</span><div><p>${esc(sentence)}</p><small>${esc(title)} · ${esc(ago(job.updated_at || job.created_at))}</small><div class="draft-actions">${[
-      ["post", "Post", "check"],
+      ["review", "Review draft", "check"],
       ["edit", "Edit", "edit"],
       ["discard", "Discard", "trash"],
     ]
       .map(
         ([suffix, label, name]) =>
-          `<button type="button" class="button button-small" data-action="draft-${suffix}" data-id="${esc(job.job_id)}" aria-describedby="${esc(note)}">${icon(name)}${label}</button>`,
+          `<button type="button" class="button button-small${suffix === "post" ? " button-primary" : suffix === "discard" ? " button-quiet" : ""}" data-action="draft-${suffix}" data-id="${esc(job.job_id)}" aria-describedby="${esc(note)}">${icon(name)}${label}</button>`,
       )
       .join(
         "",
-      )}</div><p class="field-hint" id="${esc(note)}">A draft is a proposal, not a posted change. Post sends it after the required checks; Edit changes its wording. Discard stops remaining drafts. Previously posted changes remain on GitHub.</p></div></div>`;
+      )}</div><p class="field-hint" id="${esc(note)}">A draft is a proposal, not a posted change. Post sends it after the required checks. Edit changes its wording. Discard stops remaining drafts. Previously posted changes remain on GitHub. Posting does not merge — you merge on GitHub.</p></div></div>`;
   }
   function loadDigest(force = false) {
     const state = (A.digest ||= {
@@ -692,7 +770,7 @@
         return true;
       })
       .catch((error) => {
-        state.error = error.message;
+        state.error = errorMessage(error);
         return false;
       })
       .finally(() => {
@@ -708,34 +786,36 @@
     const waiting = data?.waiting_on_you || {};
     const drafts = list(waiting.drafts);
     const waitingEvents = list(waiting.events);
+    const shownWaiting = waitingEvents.slice(0,A.decisionLimit || 30);
     const done = list(data?.done);
+    const shownDone=done.slice(0,A.doneLimit||30);
     const watched = list(data?.watched);
     const heading = pageHeading(
       "Updates & decisions",
-      "Read finished work, review drafts before posting, and see which reviews FatChin follows.",
+      "Read finished work, review drafts before posting, and see which reviews FatChin follows. Posting a draft is not a merge.",
     );
     if (!data)
       return `${heading}${state?.error ? info(esc(state.error), "error") : loading("Reading finished work and decisions")}`;
     return `${heading}${state.error ? info(esc(state.error), "error") : ""}${fleetTasksPanel()}<div class="doorbell-grid"><section class="panel"><div class="panel-header"><div><h2>Done</h2><p>Newest first</p></div><span class="muted">${number(done.length)}</span></div>${
       done.length
-        ? `<div class="doorbell-list">${done.map((entry) => doorbellRow(entry, "check-circle", doorbellSentence(entry, "Finished"))).join("")}</div>`
+        ? `<div class="doorbell-list">${shownDone.map((entry) => doorbellRow(entry, "check-circle", doorbellSentence(entry, "Finished"))).join("")}</div>${done.length>shownDone.length ? `<div class="panel-actions"><span>Showing ${number(shownDone.length)} of ${number(done.length)} saved results.</span>${button("Show more finished work","recovery-done-more","plus","button-small")}</div>` : ""}`
         : empty(
             "check-circle",
             "Nothing has finished yet",
             "Each task appears here in one line as soon as it finishes, newest first.",
           )
-    }</section><section class="panel"><div class="panel-header"><div><h2>Waiting on you</h2><p>Drafts and decisions, newest first</p></div><span class="muted">${number(drafts.length + waitingEvents.length)}</span></div>${
+    }</section><section class="panel"><div class="panel-header"><div><h2>Waiting on you</h2><p>Decisions only you can make. Posting a draft does not merge it.</p></div><span class="muted">${number(drafts.length + waitingEvents.length)}</span></div>${
       drafts.length || waitingEvents.length
         ? `<div class="doorbell-list">${[
             ...drafts.map(draftRow),
-            ...waitingEvents.map((entry) =>
+            ...shownWaiting.map((entry) =>
               doorbellRow(entry, "edit", doorbellSentence(entry, "Needs your decision")),
             ),
-          ].join("")}</div>`
+          ].join("")}</div>${waitingEvents.length > shownWaiting.length ? `<div class="panel-actions"><span>Showing ${number(shownWaiting.length)} of ${number(waitingEvents.length)} saved items needing attention.</span>${button("Show more items needing attention","recovery-decisions-more","plus","button-small")}</div>` : ""}`
         : empty(
             "edit",
             "Nothing is waiting for you",
-            "Drafts that need your decision appear here with Post, Edit, and Discard.",
+            "Drafts that need Post, Edit, or Discard appear here. Ready pull requests are listed under Agent fleet, Ready to merge. You merge those on GitHub.",
           )
     }</section><section class="panel"><div class="panel-header"><div><h2>Watched</h2><p>Reviews the worker follows, newest first</p></div><span class="muted">${number(watched.length)}</span></div>${
       watched.length
@@ -779,7 +859,7 @@
         state.error = "";
       })
       .catch((error) => {
-        state.error = error.message;
+        state.error = errorMessage(error);
       })
       .finally(() => {
         state.loading = false;
@@ -795,7 +875,7 @@
       unchecked
         ? `<div class="inline-notice error">${icon("alert")}<span>No check commands are saved. Add tests in Repositories before asking FatChin to publish code changes.</span></div>`
         : `<div class="inline-notice">${icon("check-circle")}<span>${automatic ? "The fleet detects recognized project checks and records actual results on each task. Unknown commands hold publishing until you set them." : `${number(item.checks_configured)} ${item.checks_configured === 1 ? "check" : "checks"} configured. Each task shows whether they passed.`}</span></div>`
-    }<div class="status-list"><div class="status-row"><span>${icon("watch")}Automatic review follow-up</span><strong>${item.watches_armed ? "Watching for feedback" : "No active watch"}</strong></div><div class="status-row"><span>${icon("shield")}Repository rules</span><strong>${item.rulesets_readable === "unknown" || item.rulesets_readable === false ? "Could not be read" : "Readable"}</strong></div></div><div class="fence-toggle"><div><strong>${direct ? "Posts directly" : "Asks you first"}</strong><p>${direct ? "Drafts for this repository can be posted without a second confirmation." : "Drafts wait for you. Nothing is posted until you choose Post."}</p><p class="field-hint">Default: ask me every time. Merging, deleting, closing, and releasing always ask.</p></div><button type="button" class="button button-small${direct ? " button-primary" : ""}" role="switch" aria-checked="${direct}" data-action="authority-toggle" data-repo="${esc(item.repo)}" data-mode="${direct ? "ask" : "auto"}">${direct ? `${icon("shield")}Switch to asking first` : `${icon("play")}Post directly`}</button></div></div></section>`;
+    }<div class="status-list"><div class="status-row"><span>${icon("watch")}Automatic review follow-up</span><strong>${esc(item.watch_state || (item.watches_armed ? "Watching for feedback" : "No active watch"))}</strong></div><div class="status-row"><span>${icon("shield")}Repository rules</span><strong>${esc(item.rules_inspection?.state === "verified" ? "Read from GitHub" : item.rules_inspection?.state === "unavailable" ? "GitHub could not reveal the rules" : "Not checked yet")}</strong></div></div><p class="field-hint">${esc(item.watch_next_step || "Open Review watches to see or set up automatic follow-up.")}</p>${button("Review watches", "recovery-watches", "watch", "button-small")}<p class="field-hint">${esc(item.rules_inspection?.reason || "I do not know yet. Inspect the rules to ask GitHub.")}${item.rules_inspection?.checked_at ? ` Checked ${esc(date(item.rules_inspection.checked_at))}.` : ""}</p>${button("Inspect rules on GitHub", "recovery-rules", "shield", "button-small", `data-repo="${esc(item.repo)}"`)}${item.configured === false ? `<div class="spaced-top"><p>This project is covered by the fleet scope you dispatched. Save it in Repositories to prepare individual tasks and choose draft posting permission.</p>${button("Save this project in Repositories", "new-repo", "plus", "button-small", `data-repo="${esc(item.repo)}"`)}</div>` : `<div class="fence-toggle"><div><strong>${direct ? "Posts directly" : "Asks you first"}</strong><p>${direct ? "Drafts for this repository can be posted without a second confirmation." : "Drafts wait for you. Nothing is posted until you choose Post."}</p><p class="field-hint">Default: ask me every time. Merging, deleting, closing, and releasing always ask.</p></div><button type="button" class="button button-small${direct ? " button-primary" : ""}" role="switch" aria-checked="${direct}" data-action="authority-toggle" data-repo="${esc(item.repo)}" data-mode="${direct ? "ask" : "auto"}">${direct ? `${icon("shield")}Switch to asking first` : `${icon("play")}Post directly`}</button></div>`}</div></section>`;
   }
   function renderFence() {
     loadFence();
@@ -846,7 +926,8 @@
         }
       };
       if (action === "discard") return await apply({ action, name: drafts[0].name });
-      if (action === "post" && drafts.length === 1) return await post(drafts[0]);
+      // Even a single draft is previewed; choosing Post in the preview is the decision.
+      if (action === "review") action = "post";
       openDialog(action === "edit" ? "Edit your draft" : "Choose a draft to post", "YOUR DECISION",
         `<form id="draft-decision-form"><div class="wizard-stack"><div class="field"><label for="draft-choice">Draft</label><select id="draft-choice">${drafts.map((draft, index) => `<option value="${index}">${esc(draft.title || draft.name)}</option>`).join("")}</select><span class="field-hint">Already posted drafts are excluded. Each post sends only the draft you select.</span></div><div class="field"><label for="draft-body">Draft text</label><textarea id="draft-body" rows="12"${action === "edit" ? " required" : " readonly"}></textarea></div></div></form>`,
         `${button("Cancel", "dialog-close")}<button class="button button-primary" type="submit" form="draft-decision-form">${action === "edit" ? "Save draft" : "Post selected draft"}</button>`);
@@ -868,7 +949,7 @@
         });
       });
     } catch (error) {
-      toast([error.message, error.hint].filter(Boolean).join(" "), true);
+      reportError(error);
     }
   }
   // Explicit reads and one-step actions: rendering never runs a lesson.
@@ -901,7 +982,7 @@
     E.catalogLoading = true;
     api("/api/explore/catalog").then((reply) => {
       E.catalog=reply; E.catalogError="";
-    }).catch((error) => {E.catalogError=error.message;}).finally(() => {
+    }).catch((error) => {E.catalogError=errorMessage(error);}).finally(() => {
       E.catalogLoading=false;
       if(A.view==="learn")renderView();
     });
@@ -912,20 +993,33 @@
       try {const u=new URL(E.repo.trim());const parts=u.pathname.replace(/\/$/,"").split("/").filter(Boolean);if(u.hostname==="github.com"&&!u.search&&!u.hash&&parts.length===2)E.repo=parts.join("/").replace(/\.git$/,"");} catch { /* The server returns the validation message. */ }
     }
     if(!E.repo.trim()){E.error="Choose a project or enter owner/repository before opening it.";renderView();return;}
+    const previous=E.lastSuccessful;
+    const attempted=Object.fromEntries(["repo","ref","path","view","base","head"].map(key=>[key,E[key]]));
     const request=++E.request;
-    E.loading=true;E.error="";renderView();
+    E.loading=true;E.error="";E.failedRequest=null;renderView();
     try {
       const reply=await api(`/api/explore?${query({repo:E.repo.trim(),view:E.view,ref:E.ref||undefined,path:E.path||undefined,base:E.base||undefined,head:E.head||undefined})}`);
       if(request!==E.request)return;
       E.data=reply;
       E.repo=reply.repository?.full_name||E.repo;
       E.ref=reply.repository?.ref||E.ref||reply.repository?.default_branch||"";
+      E.lastSuccessful={...Object.fromEntries(["repo","ref","path","view","base","head"].map(key=>[key,E[key]])),data:reply};
     } catch(error) {
       if(request!==E.request)return;
-      E.error=error.message;E.data=null;
+      E.error=errorMessage(error);
+      E.failedRequest=attempted;
+      if(previous)Object.assign(E,previous);
+      else E.data=null;
     } finally {
       if(request===E.request){E.loading=false;if(A.view==="learn")renderView();}
     }
+  }
+  function explorerRecovery() {
+    if (!E.error) return "";
+    const attempted = E.failedRequest;
+    const requested = !attempted ? "" : attempted.view === "compare" ? `comparison ${attempted.base} → ${attempted.head}` : `${attempted.view === "history" ? "saved changes" : attempted.path || "files"} at ${attempted.ref || "the default version"}`;
+    const comparison = attempted?.view === "compare" ? `<form id="explore-recovery-compare-form"><p>Correct the versions below, then try the comparison again.</p><div class="field-grid"><div class="field"><label for="explore-recovery-base">Starting branch, tag or commit</label><input id="explore-recovery-base" value="${esc(attempted.base)}"></div><div class="field"><label for="explore-recovery-head">Version with changes</label><input id="explore-recovery-head" value="${esc(attempted.head)}"></div></div><button class="button button-small" type="submit">Try this comparison</button></form>` : "";
+    return `<div class="recovery-card" id="explore-recovery" role="alert"><h3>${attempted ? `Could not open ${esc(requested)} in ${esc(attempted.repo)}` : "Choose what to open"}</h3><p>${esc(E.error)}</p>${attempted && E.lastSuccessful ? `<p>Your last loaded view is still here: <strong>${esc(E.repo)}</strong>, version <code>${esc(E.ref)}</code>. Edit the tag or commit below, choose a branch, or return to this view.</p>` : '<p>Check the project name above and choose Open project, or try the same request again.</p>'}${comparison}<div class="heading-actions">${attempted ? button("Retry this request","explore-retry","refresh","button-small") : ""}${attempted && E.lastSuccessful ? button("Return to previous version","explore-return","back","button-small") : ""}${button("Open setup checks","diagnostics","shield","button-small")}</div></div>`;
   }
   function exploreReceipts() {
     const receipts=list(E.data?.receipts);
@@ -1006,26 +1100,26 @@
   function lessonStatus(s) {
     return {ready:"Ready for your next move",completed:"Step completed",finished:"Lesson finished",paused:"Paused",running:"Performing this step",preparing:"Preparing an explanation",uncertain:"Check what completed",ended:"Session ended"}[s]||labelState(s);
   }
-  function sessionStorage(action,value) {
+  function lessonMemory(action,value) {
     try {
       if(action==="get")return localStorage.getItem("fatchin-learning-session");
       if(value)localStorage.setItem("fatchin-learning-session",value);
       else localStorage.removeItem("fatchin-learning-session");
     }catch{return "";}
   }
-  async function restoreLesson(id=sessionStorage("get")) {
+  async function restoreLesson(id=lessonMemory("get")) {
     if(!id||L.loading)return;
     L.loading=true;L.error="";renderView();
     try{
       const r=await api(`/api/learn?${query({id})}`);
       if(!r.session)throw new Error("The saved lesson could not be read. Reload its session before trying a new action.");
       L.session=r.session;L.draft=null;
-    }catch(error){L.error=error.message;}
+    }catch(error){L.error=errorMessage(error);}
     finally{L.loading=false;if(A.view==="learn")renderView();}
   }
   function lessonSetup() {
     const setup=L.setup;
-    return `<section class="panel"><div class="panel-header"><div><h2>Learn by doing, one move at a time</h2><p>Practice real Git commands in a disposable project, or tour the project above.</p></div></div><form id="learn-start-form" class="panel-body"><div class="learn-mode-grid" role="group" aria-label="Choose how to learn">${[["guide","Guide me","You choose each prepared action and edit the practice file yourself. FatChin explains each move."],["show","Show me","Read the explanation, then let FatChin perform one visible step. You decide when to continue."]].map(([value,title,description])=>`<label class="choice-card${setup.mode===value?" selected":""}"><input type="radio" name="learn-mode" value="${value}"${setup.mode===value?" checked":""}><span><strong>${title}</strong><p>${description}</p></span></label>`).join("")}</div><div class="field spaced-top"><label for="learn-lesson">What would you like to learn?</label><select id="learn-lesson"><option value="git-basics"${setup.lesson==="git-basics"?" selected":""}>Git basics: edit, inspect, save and branch</option><option value="repo-tour"${setup.lesson==="repo-tour"?" selected":""}>Project tour: files, history and comparisons</option></select><span class="field-hint">Git basics uses a fresh practice project. A project tour reads the selected project without changing it.</span></div><div class="field-grid spaced-top">${destinationFields(setup,"learn")}</div><p class="field-hint spaced-top">Your selected folder receives a transcript only when you choose Export. Practice changes stay in a disposable project. Asking for an explanation sends selected source excerpts and lesson evidence to the configured model provider.</p><div class="heading-actions spaced-top"><button type="submit" id="learn-start" class="button button-primary"${L.busy?" disabled":""}>${icon("play")}Start a lesson</button>${sessionStorage("get")?button("Resume saved lesson","learn-restore","refresh"):""}</div></form></section>`;
+    return `<section class="panel"><div class="panel-header"><div><h2>Learn by doing, one move at a time</h2><p>Practice real Git commands in a disposable project, or tour the project above.</p></div></div><form id="learn-start-form" class="panel-body"><div class="learn-mode-grid" role="group" aria-label="Choose how to learn">${[["guide","Guide me","You choose each prepared action and edit the practice file yourself. FatChin explains each move."],["show","Show me","Read the explanation, then let FatChin perform one visible step. You decide when to continue."]].map(([value,title,description])=>`<label class="choice-card${setup.mode===value?" selected":""}"><input type="radio" name="learn-mode" value="${value}"${setup.mode===value?" checked":""}><span><strong>${title}</strong><p>${description}</p></span></label>`).join("")}</div><div class="field spaced-top"><label for="learn-lesson">What would you like to learn?</label><select id="learn-lesson"><option value="git-basics"${setup.lesson==="git-basics"?" selected":""}>Git basics: edit, inspect, save and branch</option><option value="repo-tour"${setup.lesson==="repo-tour"?" selected":""}>Project tour: files, history and comparisons</option></select><span class="field-hint">Git basics uses a fresh practice project. A project tour reads the selected project without changing it.</span></div><div class="field-grid spaced-top">${destinationFields(setup,"learn")}</div><p class="field-hint spaced-top">Your selected folder receives a transcript only when you choose Export. Practice changes stay in a disposable project. Asking for an explanation sends selected source excerpts and lesson evidence to the configured model provider.</p><div class="heading-actions spaced-top"><button type="submit" id="learn-start" class="button button-primary"${L.busy?" disabled":""}>${icon("play")}Start a lesson</button>${lessonMemory("get")?button("Resume saved lesson","learn-restore","refresh"):""}</div></form></section>`;
   }
   function lessonWorkspace() {
     const s=L.session;
@@ -1049,13 +1143,13 @@
     else if(s.status==="paused")controls=button("Resume lesson","learn-resume","play","button-primary",busyNow?"disabled":"");
     else if(s.status==="uncertain")controls=button("Check the practice project","learn-reconcile","search","button-primary",busyNow?"disabled":"");
     const transcript=list(s.receipts);
-    return `<section class="panel learn-session" aria-label="Learning session"><div class="panel-header"><div><p class="eyebrow">${s.lesson==="git-basics"?"DISPOSABLE PRACTICE PROJECT":"READ-ONLY PROJECT TOUR"}</p><h2>${s.mode==="guide"?"You make the moves. FatChin explains.":"Watch one move, then choose the next."}</h2><p>${esc(s.repo||"Git basics")} · ${esc(lessonStatus(s.status))}</p></div>${badge(s.status)}</div><div class="panel-body">${L.error?`<div role="alert">${info(esc(L.error),"error")}</div>`:""}${s.error?info(esc(typeof s.error==="string"?s.error:JSON.stringify(s.error)),"warning"):""}${s.status==="failed"?info("This command did not complete successfully. Read the recorded output, export your transcript, then end this lesson and begin a fresh practice session.","warning"):""}${s.status==="uncertain"?info("The previous request ended before its result was confirmed. Check the project before continuing so a saved change is not repeated.","warning"):""}${s.status==="paused"?info("The lesson is paused. Resume when you are ready. A command that already finished remains in the record."):""}${s.status==="ended"?info("This lesson has ended and its disposable practice files are no longer available. Previously exported transcripts remain in your folder."):""}${s.status==="finished"?info("You completed this lesson. Export your transcript to keep the commands, explanations and practice text."):""}${!ended&&step.id?`<div class="learn-step"><p class="eyebrow">MOVE ${number(Number(s.step_index||0)+1)}</p><h3>${esc(step.title)}</h3><p class="learn-intent">${esc(step.intent)}</p>${step.instruction?`<p>${esc(step.instruction)}</p>`:""}${command?`<div class="learn-command"><span class="field-label">Prepared command or read request</span><pre>${esc(command)}</pre><p>${esc(step.explanation)}</p>${step.memory_aid?`<p class="learn-memory"><strong>Remember it:</strong> ${esc(step.memory_aid)}</p>`:""}</div>`:""}${narrated?`<div class="learn-narration" role="status"><div>${icon(step.narration_source==="built-in"?"help":"spark")}<strong>${step.narration_source==="built-in"?"Built-in explanation":"Model explanation"}</strong></div><div class="learn-narration-text">${narrativeHTML(step.narration)}</div></div>`:`<p class="field-hint">Choose an explanation first. FatChin waits for you to read it before an action becomes available.</p>`}${s.lesson==="git-basics"&&s.practice?`<details class="learn-practice"${editing?" open":""}><summary>${editing?"Edit your practice file: ":"Inspect practice file: "}${esc(s.practice.filename||"lesson.txt")}</summary><div><label for="learn-practice-content">Practice file contents</label><textarea id="learn-practice-content" class="learn-file-editor" rows="6" spellcheck="false"${s.mode!=="guide"||!ready||!editing||busyNow?" readonly":""}>${esc(content)}</textarea><p class="field-hint">${s.mode==="guide"&&ready&&editing?"Write a short sentence, then choose Save my practice edit. This changes only the disposable practice file.":s.mode === "show" && ready && editing ? "This is the prepared edit. It is saved only when you choose Run this one step." : "This is the saved practice text. Only the prepared edit step can change it."}</p></div></details>`:""}<div class="learn-primary-actions">${controls}${busyNow?loading("Waiting for this request. No following step will start."):""}</div><p class="field-hint">${external?"This acknowledgement records what you report. FatChin does not observe the other tab.":completed?"Read the result below. Choose Next move when you are ready; nothing continues automatically.":"Your real project is unchanged. Every action stays in this lesson’s practice project or reads the selected repository."}</p></div>`:""}<div class="learn-session-actions">${!ended&&s.status!=="paused"?button("Pause","learn-pause","pause"):""}${button("Reload session","learn-restore","refresh","",L.loading?"disabled":"")}${button("Export transcript","learn-export","download","",busyNow?"disabled":"")}${!ended?button("End lesson","learn-end","stop","button-danger"):button("Start another lesson","learn-new","plus")}</div><p class="field-hint">Transcript destination: <code>${esc(s.output_dir)}</code>. Ending a lesson removes its disposable files; export first to keep learning work.</p>${s.status!=="ended"?`<form id="learn-question-form" class="learn-question"><label for="learn-question">Ask about this move or its result</label><div class="input-action"><input id="learn-question" value="${esc(L.question)}" maxlength="2000" placeholder="For example: How is add different from commit?" required><button class="button" type="submit"${canAsk?"":" disabled"}>${icon("help")}Ask</button></div><p class="field-hint">One model explanation, without running a command or advancing the lesson.</p></form>`:""}${s.answer?`<div class="learn-narration"><strong>Answer about your lesson</strong><div class="learn-narration-text">${narrativeHTML(s.answer)}</div></div>`:""}<section class="learn-subsection" aria-label="Visible action record"><h3>What actually happened</h3>${transcript.length?`<ol class="learn-receipts">${transcript.map((r)=>`<li><div><strong>${receiptOutcome(r)}</strong><time>${esc(date(r.at))}</time></div>${r.command?`<pre>${esc(commandText(r.command))}</pre>`:""}<pre>${esc(typeof r.output==="string"?r.output:JSON.stringify(r.output??"",null,2))}</pre>${r.observed===false?'<p class="field-hint">FatChin did not confirm this action.</p>':""}${r.narration?`<details class="learn-receipt-explanation"><summary>Explanation before this move</summary><div class="learn-narration-text">${narrativeHTML(r.narration)}</div></details>`:""}</li>`).join("")}</ol>`:'<p class="muted">No action has run yet. Explanations and prepared commands appear above before anything happens.</p>'}</section>${s.repo?`<section class="learn-subsection"><h3>Ready to make a real project change?</h3><p>This leaves the paced lesson. The ordinary worker prepares documentation or issue drafts in the background; it does not pause after each command. Review your request, follow progress in Tasks, then decide what to post in Updates & decisions. The task uses this lesson’s account and results folder.</p><div class="heading-actions spaced-top">${button("Draft documentation","learn-handoff","edit","",'data-kind="write-docs"')}${button("Draft issues from my request","learn-handoff","issue","",'data-kind="triage-issues"')}</div></section>`:""}</div></section>`;
+    return `<section class="panel learn-session" aria-label="Learning session"><div class="panel-header"><div><p class="eyebrow">${s.lesson==="git-basics"?"DISPOSABLE PRACTICE PROJECT":"READ-ONLY PROJECT TOUR"}</p><h2>${s.mode==="guide"?"You make the moves. FatChin explains.":"Watch one move, then choose the next."}</h2><p>${esc(s.repo||"Git basics")} · ${esc(lessonStatus(s.status))}</p></div>${badge(s.status)}</div><div class="panel-body">${L.error?`<div role="alert">${info(esc(L.error),"error")}</div>`:""}${s.error?info(esc(typeof s.error==="string"?s.error:JSON.stringify(s.error)),"warning"):""}${s.status==="failed"?info("This command did not complete successfully. Read the recorded output, export your transcript, then end this lesson and begin a fresh practice session.","warning"):""}${s.status==="uncertain"?info("The previous request ended before its result was confirmed. Check the project before continuing so a saved change is not repeated.","warning"):""}${s.status==="paused"?info("The lesson is paused. Resume when you are ready. A command that already finished remains in the record."):""}${s.status==="ended"?info("This lesson has ended and its disposable practice files are no longer available. Previously exported transcripts remain in your folder."):""}${s.status==="finished"?info("You completed this lesson. Export your transcript to keep the commands, explanations and practice text."):""}${!ended&&step.id?`<div class="learn-step"><p class="eyebrow">MOVE ${number(Number(s.step_index||0)+1)}</p><h3>${esc(step.title)}</h3><p class="learn-intent">${esc(step.intent)}</p>${step.instruction?`<p>${esc(step.instruction)}</p>`:""}${command?`<div class="learn-command"><span class="field-label">Prepared command or read request</span><pre>${esc(command)}</pre><p>${esc(step.explanation)}</p>${step.memory_aid?`<p class="learn-memory"><strong>Remember it:</strong> ${esc(step.memory_aid)}</p>`:""}</div>`:""}${narrated?`<div class="learn-narration" role="status"><div>${icon(step.narration_source==="built-in"?"help":"spark")}<strong>${step.narration_source==="built-in"?"Built-in explanation":"Model explanation"}</strong></div><div class="learn-narration-text">${narrativeHTML(step.narration)}</div></div>`:`<p class="field-hint">Choose an explanation first. FatChin waits for you to read it before an action becomes available.</p>`}${s.lesson==="git-basics"&&s.practice?`<details class="learn-practice"${editing?" open":""}><summary>${editing?"Edit your practice file: ":"Inspect practice file: "}${esc(s.practice.filename||"lesson.txt")}</summary><div><label for="learn-practice-content">Practice file contents</label><textarea id="learn-practice-content" class="learn-file-editor" rows="6" spellcheck="false"${s.mode!=="guide"||!ready||!editing||busyNow?" readonly":""}>${esc(content)}</textarea><p class="field-hint">${s.mode==="guide"&&ready&&editing?"Write a short sentence, then choose Save my practice edit. This changes only the disposable practice file.":s.mode === "show" && ready && editing ? "This is the prepared edit. It is saved only when you choose Run this one step." : "This is the saved practice text. Only the prepared edit step can change it."}</p></div></details>`:""}<div class="learn-primary-actions">${controls}${busyNow?loading("Waiting for this request. No following step will start."):""}</div><p class="field-hint">${external?"This acknowledgement records what you report. FatChin does not observe the other tab.":completed?"Read the result below. Choose Next move when you are ready; nothing continues automatically.":"Your real project is unchanged. Every action stays in this lesson’s practice project or reads the selected repository."}</p></div>`:""}<div class="learn-session-actions">${!ended&&!["paused","failed","finished"].includes(s.status)?button("Pause","learn-pause","pause"):""}${button("Change transcript folder","recovery-lesson-destination","folder","",busyNow?"disabled":"")}<a class="button" href="/api/learn/transcript?${query({id:s.id})}" data-lesson-download download>${icon("download")}Download transcript</a>${button("Reload session","learn-restore","refresh","",L.loading?"disabled":"")}${button("Export transcript","learn-export","download","",busyNow?"disabled":"")}${!ended?button("End lesson","learn-end","stop","button-danger"):button("Start another lesson","learn-new","plus")}</div><p class="field-hint">Transcript destination: <code>${esc(s.output_dir)}</code>. Ending a lesson removes its disposable files; export first to keep learning work.</p>${s.status!=="ended"?`<form id="learn-question-form" class="learn-question"><label for="learn-question">Ask about this move or its result</label><div class="input-action"><input id="learn-question" value="${esc(L.question)}" maxlength="2000" placeholder="For example: How is add different from commit?" required><button class="button" type="submit"${canAsk?"":" disabled"}>${icon("help")}Ask</button></div><p class="field-hint">One model explanation, without running a command or advancing the lesson.</p></form>`:""}${s.answer?`<div class="learn-narration"><strong>Answer about your lesson</strong><div class="learn-narration-text">${narrativeHTML(s.answer)}</div></div>`:""}<section class="learn-subsection" aria-label="Visible action record"><h3>What actually happened</h3>${transcript.length?`<ol class="learn-receipts">${transcript.map((r)=>`<li><div><strong>${receiptOutcome(r)}</strong><time>${esc(date(r.at))}</time></div>${r.command?`<pre>${esc(commandText(r.command))}</pre>`:""}<pre>${esc(typeof r.output==="string"?r.output:JSON.stringify(r.output??"",null,2))}</pre>${r.observed===false?'<p class="field-hint">FatChin did not confirm this action.</p>':""}${r.narration?`<details class="learn-receipt-explanation"><summary>Explanation before this move</summary><div class="learn-narration-text">${narrativeHTML(r.narration)}</div></details>`:""}</li>`).join("")}</ol>`:'<p class="muted">No action has run yet. Explanations and prepared commands appear above before anything happens.</p>'}</section>${s.repo?`<section class="learn-subsection"><h3>Ready to make a real project change?</h3><p>This leaves the paced lesson. The ordinary worker prepares documentation or issue drafts in the background; it does not pause after each command. Review your request, follow progress in Tasks, then decide what to post in Updates & decisions. The task uses this lesson’s account and results folder.</p><div class="heading-actions spaced-top">${button("Draft documentation","learn-handoff","edit","",'data-kind="write-docs"')}${button("Draft issues from my request","learn-handoff","issue","",'data-kind="triage-issues"')}</div></section>`:""}</div></section>`;
   }
   function renderLearn() {
     loadExploreCatalog();
-    if(!L.restoreChecked){L.restoreChecked=true;const id=sessionStorage("get");if(id){E.tab="lesson";queueMicrotask(()=>restoreLesson(id));}}
+    if(!L.restoreChecked){L.restoreChecked=true;const id=lessonMemory("get");if(id){E.tab="lesson";queueMicrotask(()=>restoreLesson(id));}}
     const configured=[...new Set([...repos().map(repoName), ...watchedRepositories().map((r) => r.repo)])];
-    return `${pageHeading("Explore & learn","Understand a project, find the right view, and learn Git at your own pace.")}${L.error&&!L.session?info(esc(L.error),"error"):""}<section class="panel explore-selection"><div class="panel-header"><div><h2>Choose a project to explore</h2><p>Opening files and comparisons reads the project. It does not edit code or start the model.</p></div></div><form id="explore-form" class="panel-body"><div class="field-grid"><div class="field"><label for="explore-repo">Saved project</label><select id="explore-repo"><option value="">Choose a saved project…</option>${configured.map((r)=>`<option value="${esc(r)}"${E.repo===r?" selected":""}>${esc(r)}</option>`).join("")}</select></div><div class="field"><label for="explore-custom">Or enter a public repository</label><input id="explore-custom" value="${esc(configured.includes(E.repo)?"":E.repo)}" placeholder="owner/repository or https://github.com/owner/repository" autocomplete="off"><span class="field-hint">Inspect a public project without adding it to the worker.</span></div></div><div class="heading-actions spaced-top"><button class="button button-primary" type="submit"${E.loading?" disabled":""}>${icon("repo")}Open project</button>${E.data?`<span class="badge">${E.data.repository?.private===false?"Public project":E.data.repository?.private===true?"Private project":"Visibility unverified"}</span><span class="field-hint">Viewing <code>${esc(E.data.repository?.sha?.slice(0,10)||E.ref)}</code></span>`:""}</div></form></section><div class="explore-tabs" role="tablist" aria-label="Explore and learn sections">${[["browse","Files & history","folder"],["tools","Other useful views","external"],["shortcuts","GitHub shortcuts","terminal"],["lesson","Learn step by step","help"]].map(([id,label,name])=>`<button type="button" id="explore-tab-${id}" class="explore-tab${E.tab===id?" active":""}" role="tab" aria-selected="${E.tab===id}" aria-controls="explore-panel" tabindex="${E.tab===id?0:-1}" data-action="explore-tab" data-tab="${id}">${icon(name)}${label}</button>`).join("")}</div><div id="explore-panel" role="tabpanel" aria-labelledby="explore-tab-${esc(E.tab)}">${E.tab==="lesson"?lessonWorkspace():E.tab==="tools"?`<section class="panel"><div class="panel-body">${explorerTools()}</div></section>`:E.tab==="shortcuts"?`<section class="panel"><div class="panel-body">${explorerShortcuts()}</div></section>`:`<section class="panel"><div class="panel-body">${E.error?`<div role="alert">${info(esc(E.error),"error")}</div>`:""}${E.data?`<div class="explore-view-controls"><div class="field"><label for="explore-ref">Branch</label><select id="explore-ref">${!list(E.data.branches).some((b)=>b.name===E.ref)?`<option value="${esc(E.ref)}" selected>${esc(E.ref)} (selected version)</option>`:""}${list(E.data.branches).map((b)=>`<option value="${esc(b.name)}"${b.name===E.ref?" selected":""}>${esc(b.name)}</option>`).join("")}</select><details class="explore-version-tools"><summary>Open a tag or saved commit</summary><div class="input-action"><input id="explore-version" aria-label="Tag or commit to inspect" placeholder="For example, v1.0 or a commit ID" value="${esc(E.otherRef||"")}">${button("Open version","explore-version","arrow","button-small")}</div><p class="field-hint">A tag names a release. A commit ID identifies one saved version. Both are read-only here.</p></details></div><div class="heading-actions">${button("Files","explore-view","folder",E.view==="tree"||E.view==="file"?"button-primary":"",'data-view="tree"')}${button("Saved changes","explore-view","clock",E.view==="history"?"button-primary":"",'data-view="history"')}${button("Compare branches","explore-view","branch",E.view==="compare"?"button-primary":"",'data-view="compare"')}</div></div>${E.view==="compare"?`<form id="explore-compare-form" class="explore-compare-form"><div class="field"><label for="explore-base">Starting branch, tag or commit</label><input id="explore-base" list="explore-versions" value="${esc(E.base)}" autocomplete="off"><datalist id="explore-versions">${list(E.data.branches).map((b)=>`<option value="${esc(b.name)}"></option>`).join("")}</datalist></div><div class="field"><label for="explore-head">Version with changes</label><input id="explore-head" list="explore-versions" value="${esc(E.head)}" autocomplete="off"></div><button class="button" type="submit">${icon("branch")}Compare branches</button></form>`:""}`:""}${explorerContent()}</div></section>`}</div>`;
+    return `${pageHeading("Explore & learn","Understand a project, find the right view, and learn Git at your own pace.")}${L.error&&!L.session?info(esc(L.error),"error"):""}<section class="panel explore-selection"><div class="panel-header"><div><h2>Choose a project to explore</h2><p>Opening files and comparisons reads the project. It does not edit code or start the model.</p></div></div><form id="explore-form" class="panel-body"><div class="field-grid"><div class="field"><label for="explore-repo">Saved project</label><select id="explore-repo"><option value="">Choose a saved project…</option>${configured.map((r)=>`<option value="${esc(r)}"${E.repo===r?" selected":""}>${esc(r)}</option>`).join("")}</select></div><div class="field"><label for="explore-custom">Or enter a public repository</label><input id="explore-custom" value="${esc(configured.includes(E.repo)?"":E.repo)}" placeholder="owner/repository or https://github.com/owner/repository" autocomplete="off"><span class="field-hint">Inspect a public project without adding it to the worker.</span></div></div><div class="heading-actions spaced-top"><button class="button button-primary" type="submit"${E.loading?" disabled":""}>${icon("repo")}Open project</button>${E.data?`<span class="badge">${E.data.repository?.private===false?"Public project":E.data.repository?.private===true?"Private project":"Visibility unverified"}</span><span class="field-hint">Viewing <code>${esc(E.data.repository?.sha?.slice(0,10)||E.ref)}</code></span>`:""}</div></form></section><div class="explore-tabs" role="tablist" aria-label="Explore and learn sections">${[["browse","Files & history","folder"],["tools","Other useful views","external"],["shortcuts","GitHub shortcuts","terminal"],["lesson","Learn step by step","help"]].map(([id,label,name])=>`<button type="button" id="explore-tab-${id}" class="explore-tab${E.tab===id?" active":""}" role="tab" aria-selected="${E.tab===id}" aria-controls="explore-panel" tabindex="${E.tab===id?0:-1}" data-action="explore-tab" data-tab="${id}">${icon(name)}${label}</button>`).join("")}</div><div id="explore-panel" role="tabpanel" aria-labelledby="explore-tab-${esc(E.tab)}">${E.tab==="lesson"?lessonWorkspace()+savedLessonsPanel():E.tab==="tools"?`<section class="panel"><div class="panel-body">${explorerTools()}</div></section>`:E.tab==="shortcuts"?`<section class="panel"><div class="panel-body">${explorerShortcuts()}</div></section>`:`<section class="panel"><div class="panel-body">${explorerRecovery()}${E.data?`<div class="explore-view-controls"><div class="field"><label for="explore-ref">Branch</label><select id="explore-ref">${!list(E.data.branches).some((b)=>b.name===E.ref)?`<option value="${esc(E.ref)}" selected>${esc(E.ref)} (selected version)</option>`:""}${list(E.data.branches).map((b)=>`<option value="${esc(b.name)}"${b.name===E.ref?" selected":""}>${esc(b.name)}</option>`).join("")}</select><details class="explore-version-tools"${E.failedRequest ? " open" : ""}><summary>Open a tag or saved commit</summary><div class="input-action"><input id="explore-version" aria-label="Tag or commit to inspect" placeholder="For example, v1.0 or a commit ID" value="${esc(E.otherRef||"")}">${button("Open version","explore-version","arrow","button-small")}</div><p class="field-hint">A tag names a release. A commit ID identifies one saved version. Both are read-only here.</p></details></div><div class="heading-actions">${button("Files","explore-view","folder",E.view==="tree"||E.view==="file"?"button-primary":"",'data-view="tree"')}${button("Saved changes","explore-view","clock",E.view==="history"?"button-primary":"",'data-view="history"')}${button("Compare branches","explore-view","branch",E.view==="compare"?"button-primary":"",'data-view="compare"')}</div></div>${E.view==="compare"?`<form id="explore-compare-form" class="explore-compare-form"><div class="field"><label for="explore-base">Starting branch, tag or commit</label><input id="explore-base" list="explore-versions" value="${esc(E.base)}" autocomplete="off"><datalist id="explore-versions">${list(E.data.branches).map((b)=>`<option value="${esc(b.name)}"></option>`).join("")}</datalist></div><div class="field"><label for="explore-head">Version with changes</label><input id="explore-head" list="explore-versions" value="${esc(E.head)}" autocomplete="off"></div><button class="button" type="submit">${icon("branch")}Compare branches</button></form>`:""}`:""}${explorerContent()}</div></section>`}</div>`;
   }
   async function startLesson() {
     if(L.busy)return;
@@ -1078,11 +1172,11 @@
       const reply=await api("/api/learn",payload,{timeout:180000});
       if(request!==L.request)return;
       if(!reply.session)throw new Error("The lesson response was incomplete. Reload the session before trying the action again.");
-      L.session=reply.session;if(["start","edit","run","perform","next","end"].includes(action))L.draft=null;sessionStorage("set",reply.session.id);
+      L.session=reply.session;if(["start","edit","run","perform","next","end"].includes(action))L.draft=null;lessonMemory("set",reply.session.id);
       if(action==="export")toast("Transcript exported to your selected results folder.");
     }catch(error){
       if(request!==L.request)return;
-      L.error=error.message;
+      L.error=errorMessage(error);
       if(action!=="start"&&L.session?.id){
         try{L.session=(await api(`/api/learn?${query({id:L.session.id})}`)).session||L.session;}
         catch{/* Keep the recorded error and last known state. */}
@@ -1099,6 +1193,11 @@
     $("#explore-custom")?.addEventListener("input",(e)=>{E.repo=e.target.value;$("#explore-repo").value="";});
     $("#explore-version")?.addEventListener("input",(e)=>{E.otherRef=e.target.value;});
     $("#explore-ref")?.addEventListener("change",(e)=>loadExplore({ref:e.target.value,path:"",view:"tree"}));
+    $("#explore-recovery-compare-form")?.addEventListener("submit", event => {
+      event.preventDefault();
+      const attempted = E.failedRequest;
+      if (attempted) loadExplore({...attempted, base:$("#explore-recovery-base").value, head:$("#explore-recovery-head").value});
+    });
     $("#explore-compare-form")?.addEventListener("submit",(e)=>{e.preventDefault();loadExplore({base:$("#explore-base").value,head:$("#explore-head").value,view:"compare"});});
     $("#explore-base")?.addEventListener("change",(e)=>{E.base=e.target.value;});
     $("#explore-head")?.addEventListener("change",(e)=>{E.head=e.target.value;});
@@ -1108,7 +1207,7 @@
       const next=e.key==="ArrowRight"?(index+1)%tabs.length:e.key==="ArrowLeft"?(index+tabs.length-1)%tabs.length:e.key==="Home"?0:e.key==="End"?tabs.length-1:-1;
       if(next>=0){e.preventDefault();E.tab=tabs[next].dataset.tab;renderView();$("#explore-tab-"+E.tab)?.focus();}
     }));
-    $("#learn-start-form")?.addEventListener("submit",(e)=>{e.preventDefault();startLesson().catch((error)=>{L.error=error.message;renderView();});});
+    $("#learn-start-form")?.addEventListener("submit",(e)=>{e.preventDefault();startLesson().catch((error)=>{L.error=errorMessage(error);renderView();});});
     $$('input[name="learn-mode"]').forEach((el)=>el.addEventListener("change",(e)=>{L.setup.mode=e.target.value;renderView();}));
     $("#learn-lesson")?.addEventListener("change",(e)=>{L.setup.lesson=e.target.value;});
     bindDestination(L.setup,"learn");
@@ -1125,6 +1224,8 @@
       if(f)return loadExplore({path:f.path,view:["dir","tree","directory"].includes(f.type)?"tree":"file"});
       return;
     }
+    if(action==="explore-retry")return loadExplore({...E.failedRequest});
+    if(action==="explore-return"){E.request++;E.loading=false;E.error="";E.failedRequest=null;E.otherRef=E.ref;renderView();return;}
     if(action==="explore-version"){const ref=E.otherRef?.trim();if(!ref){E.error="Enter the tag or saved commit to inspect.";renderView();return;}return loadExplore({ref,path:"",view:"tree"});}
     if(action==="explore-parent")return loadExplore({path:element.dataset.path,view:"tree"});
     if(action==="explore-view"){
@@ -1152,12 +1253,12 @@
       L.error="Save my practice edit before exporting. The transcript includes the saved file; text still in the editor has not been saved.";
       toast(L.error,true);renderView();return;
     }
-    if(action==="learn-new"){L.session=null;L.draft=null;L.error="";sessionStorage("set","");renderView();return;}
+    if(action==="learn-new"){L.session=null;L.draft=null;L.error="";lessonMemory("set","");renderView();return;}
     if(action==="learn-end")return confirmDialog("End this lesson?",unsavedPractice() ? "You have unsaved text in the editor. Choose Cancel, then Save my practice edit and Export transcript to keep it. Ending now discards that text and removes the disposable practice files; your real repository and existing exports remain." : "The disposable practice project will be removed after any running action finishes. Export first if you want to keep its text and command record. Your real repository and previously exported transcripts remain in place.","End lesson",async()=>{closeDialog();await mutateLesson("end");});
     if(action==="learn-handoff"){
       const s=L.session;if(!s)return;
       if(!repos().some((r)=>repoName(r)===s.repo)){
-        openDialog("Add this project before creating a task","PROJECT CHANGE",`<p class="dialog-copy">Learning can inspect public projects without configuration. To request a real change in <strong>${esc(s.repo)}</strong>, add it in Repositories, set its checks and restart the idle worker. Then return to this lesson.</p>`,button("Close","dialog-close"));return;
+        openDialog("Add this project before creating a task","PROJECT CHANGE",`<p class="dialog-copy">Learning can inspect public projects without configuration. To request a real change in <strong>${esc(s.repo)}</strong>, add it in Repositories, set its checks and restart the idle worker. Then return to this lesson.</p>`,button("Add this project and return here","recovery-lesson-addrepo","repo")+button("Close","dialog-close"));return;
       }
       newTask(s.repo);
       if(A.wizard){
@@ -1175,7 +1276,7 @@
   const F = {
     data: null, loading: null, busy: false, version: 0, setupExpanded: true, error: "", lastGood: "", tab: "agents",
     setup: {account: "", output_dir: "", scope: "all", repos: [], workers: 10, deepseek_workers: 10, dry_run: true},
-    search: "", visibleLimit: 200, repoFilter: "all", repoQuery: "", repoResults: [], repoError: "", searching: false,
+    search: "", visibleLimit: 50, repoFilter: "all", repoQuery: "", repoResults: [], repoError: "", searching: false,
   };
   const fleetKinds = {review_pr: "Review a pull request", fix_comment: "Fix a review comment", review_code: "Review project code"};
   function currentFleet() {
@@ -1196,8 +1297,8 @@
     return url ? `<a class="${esc(cls)}" href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)} ${icon("external")}</a>` : "";
   }
   function fleetStatus(status) {
-    const names = {idle: "Available", awaiting_merge: "Correction awaiting merge", unverified: "Needs a fresh check", unavailable: "Provider unavailable", queued: "Waiting its turn", running: "Working", retrying: "Retrying automatically", recovering: "Resetting automatically", backoff: "Waiting before retry", blocked: "Needs attention", done: "Finished", ready: "Ready to merge", dismissed: "No change needed", paused: "Paused", pausing: "Finishing current work", stopped: "Stopped", stopping: "Stopping", waiting: "Watching for work"};
-    const cls = ["blocked", "retrying", "recovering", "backoff", "paused", "pausing", "stopping"].includes(status) ? "warning" : ["ready", "done", "running"].includes(status) ? "success" : "";
+    const names = {idle: "Available", awaiting_merge: "Waiting for your merge", unverified: "Needs a fresh check", unavailable: "Provider unavailable", queued: "Waiting its turn", running: "Working", retrying: "Retrying automatically", recovering: "Resetting automatically", backoff: "Waiting before retry", blocked: "Needs attention", done: "Finished", ready: "Ready for your merge", dismissed: "No change needed", paused: "Paused", pausing: "Finishing current work", stopped: "Stopped", stopping: "Stopping", waiting: "Watching for work"};
+    const cls = ["awaiting_merge", "ready"].includes(status) ? "gate" : ["blocked", "retrying", "recovering", "backoff", "paused", "pausing", "stopping"].includes(status) ? "warning" : ["done", "running"].includes(status) ? "success" : "";
     return `<span class="badge badge-${cls}">${esc(names[status] || labelState(status))}</span>`;
   }
   function fleetFiltered(rows) {
@@ -1233,16 +1334,9 @@
     }).join("")}</div></details>`;
   }
   function fleetItem(item, ready = false) {
-    const result = item.result || {};
-    const title = item.title || fleetKinds[item.kind] || "Work item";
-    const url = item.url || item.html_url || result.url;
+    const result = item.result || {}, r = item.recovery || {};
     const detail = item.error || result.error || item.blocked_reason || result.summary || "";
-    const failedChecks = fleetFailedChecks(item);
-    const canRetryItem = ["blocked", "failed"].includes(item.status) || (item.status === "done" && failedChecks);
-    const checks = result.checks || item.checks;
-    const nextStep = result.next_action || item.next_action;
-    const nextAction = nextStep === "configure_checks" ? "Choose Set verification command to save this project’s check. Waiting work resumes automatically." : nextStep || (failedChecks ? "Read the failed command and its output below. If this project needs a different check, choose Set verification command. After correcting the reported setup problem, choose Retry this item." : "");
-    return `<article class="fleet-item" data-fleet-item="${esc(item.id)}"><div class="fleet-item-icon">${icon(item.kind === "fix_comment" ? "issue" : "pr")}</div><div class="fleet-item-content"><div class="fleet-item-heading"><h3>${fleetLink(url, title) || esc(title)}</h3>${fleetStatus(ready ? (F.error ? "unverified" : "ready") : failedChecks ? "blocked" : item.kind === "fix_comment" && item.status === "done" && result.fix_pr ? "awaiting_merge" : item.status)}</div><p class="fleet-item-location">${esc(item.repo || "Repository not recorded")}${item.number ? ` · #${esc(item.number)}` : ""} · ${esc(fleetKinds[item.kind] || "Pull request")}</p>${detail ? `<p class="fleet-item-detail">${esc(detail)}</p>` : ""}${fleetProvenance(item)}${ready ? `<p class="field-hint">Reviewed version <code>${esc((item.head_sha || result.head_sha || "").slice(0, 10) || "Recorded by GitHub")}</code>. Recheck GitHub’s merge controls, then merge and choose Delete branch there.</p>` : ""}${nextAction ? `<p class="fleet-next-action"><strong>Next step:</strong> ${esc(nextAction)}</p>` : ""}${fleetChecks(checks)}${canRetryItem ? `<div class="heading-actions spaced-top">${button("Retry this item", "fleet-retry", "refresh", "button-small", `data-id="${esc(item.id)}" data-fleet-id="${esc(item.fleet_id)}"${F.busy ? " disabled" : ""}`)}${button("Set verification command", "fleet-configure-checks", "check-circle", "button-small", `data-repo="${esc(item.source_repo || item.repo)}" data-id="${esc(item.id)}"${F.busy ? " disabled" : ""}`)}</div>` : ""}</div></article>`;
+    return `<article class="fleet-item" data-fleet-item="${esc(item.id)}"><div class="fleet-item-icon">${icon(item.kind === "fix_comment" ? "issue" : "pr")}</div><div class="fleet-item-content"><div class="fleet-item-heading"><h3><button class="row-button" data-action="fleet-open-item" data-id="${esc(item.id)}">${esc(item.title || fleetKinds[item.kind] || "Saved work item")}</button></h3>${item.archived_at ? badge("archived") : fleetStatus(ready ? (F.error ? "unverified" : "ready") : fleetFailedChecks(item) ? "blocked" : item.status)}</div><p class="fleet-item-location">${esc(item.repo || "Repository not recorded")}${item.number ? ` · #${esc(item.number)}` : ""} · Fleet ${esc(item.fleet_status || "saved")}</p>${r.title ? `<p><strong>${esc(r.title)}</strong></p>` : ""}${detail ? `<p class="fleet-item-detail">${esc(detail)}</p>` : ""}${fleetProvenance(item)}${ready ? '<p>Open GitHub to make the merge decision and inspect its current checks. Merging stays with you.</p>' : ""}${r.next_step ? `<p class="fleet-next-action"><strong>Next step:</strong> ${esc(r.next_step)}</p>` : ""}${r.retry_at ? `<p>Next automatic attempt: ${esc(date(r.retry_at))} · ${esc(r.waiting_for || "Waiting for the service")}</p>` : ""}${fleetChecks(result.checks || item.checks)}<div class="recovery-actions">${fleetRecoveryControls(item)}</div></div></article>`;
   }
   function fleetSlots() {
     const workers = list(F.data?.workers);
@@ -1254,8 +1348,9 @@
       const item = items.find((row) => row.id === worker?.item_id);
       const other = worker && selected && worker.fleet_id && worker.fleet_id !== selected.id;
       const providerConfig = list(F.data?.providers).find((p) => p.id === provider);
-      const status = worker?.status || (providerConfig?.available === false ? "unavailable" : "idle");
-      return `<article class="fleet-slot${["running", "working"].includes(status) ? " is-working" : ""}"><div class="fleet-slot-heading"><span class="fleet-slot-number">${String(slot).padStart(2, "0")}</span>${fleetStatus(status)}</div><h3>${esc(item ? fleetKinds[item.kind] || item.kind : other ? "Helping another member" : worker?.stage || (currentFleet()?.status === "running" ? "Ready for the next item" : "Ready when you start"))}</h3><p>${esc(item?.repo || worker?.repo || (other ? "Shared twenty-agent capacity" : label))}</p>${item ? `<p class="fleet-slot-task">${fleetLink(item.url, item.title || `Item #${item.number || ""}`) || esc(item.title || "Work in progress")}</p>` : ""}<div class="fleet-slot-footer"><span>${esc(worker?.stage || (status === "idle" ? "No task in progress" : labelState(status)))}</span>${Number(worker?.restarts) > 0 ? `<span>${number(worker.restarts)} automatic resets</span>` : ""}</div></article>`;
+      const stale = !worker?.heartbeat_at || Date.now() - new Date(worker.heartbeat_at).getTime() > 120000;
+      const status = selected?.status !== "running" ? "stopped" : stale && worker ? "unverified" : worker?.status || (providerConfig?.available === false ? "unavailable" : "idle");
+      return `<article class="fleet-slot${["running", "working"].includes(status) ? " is-working" : ""}"><div class="fleet-slot-heading"><span class="fleet-slot-number">${String(slot).padStart(2, "0")}</span>${fleetStatus(status)}</div><h3>${esc(item ? fleetKinds[item.kind] || item.kind : other ? "Helping another member" : worker?.stage || (currentFleet()?.status === "running" ? "Ready for the next item" : "Ready when you start"))}</h3><p>${esc(item?.repo || worker?.repo || (other ? "Shared twenty-agent capacity" : label))}</p>${item ? `<p class="fleet-slot-task">${fleetLink(item.url, item.title || `Item #${item.number || ""}`) || esc(item.title || "Work in progress")}</p>` : ""}<div class="fleet-slot-footer"><span>${esc(stale && worker ? `Historical worker record · last contact ${ago(worker.heartbeat_at)}` : selected?.status !== "running" ? "This fleet will not assign new work until you resume it." : worker?.stage || (status === "idle" ? "No task in progress" : labelState(status)))}</span>${Number(worker?.restarts) > 0 ? `<span>${number(worker.restarts)} automatic resets</span>` : ""}</div></article>`;
     }).join("")}</div></section>`).join("");
   }
   function fleetNotice() {
@@ -1266,36 +1361,39 @@
   function fleetWindow() {
     if (!F.data) return F.loading ? loading("Loading your agent fleet") : empty("jobs", "Fleet status is unavailable", "Refresh to try the connection again.", button("Refresh fleet", "fleet-refresh", "refresh"));
     const ready = fleetRows("ready"), comments = fleetRows("comments"), items = fleetRows("items");
-    const active = items.filter((item) => ["queued", "running", "retrying", "blocked"].includes(item.status) || (item.status === "done" && fleetFailedChecks(item)));
-    const tabs = [["agents", "Agents & queue", "jobs", active.length], ["ready", "Ready to merge", "check-circle", ready.length], ["comments", "Open comments", "issue", comments.length], ["activity", "Activity", "clock", null]];
+    const active = items.filter((item) => !item.archived_at && (["queued", "running", "retrying", "blocked"].includes(item.status) || (item.status === "done" && fleetFailedChecks(item))));
+    const tabs = [["agents", "Agents & queue", "jobs", active.length], ["ready", "Ready to merge", "check-circle", ready.length], ["comments", "Open comments", "issue", comments.length], ["history", "Results & history", "file", items.filter(i => !i.archived_at && ["done", "dismissed"].includes(i.status)).length], ["archived", "Archived", "folder", items.filter(i => i.archived_at).length], ["activity", "Activity", "clock", null]];
     let body;
     if (F.tab === "agents") {
       const queue = fleetFiltered(active).sort((a, b) => ({fix_comment: 0, review_pr: 1, review_code: 2}[a.kind] ?? 3) - ({fix_comment: 0, review_pr: 1, review_code: 2}[b.kind] ?? 3) || new Date(b.created_at || 0) - new Date(a.created_at || 0));
-      body = `${fleetSlots()}<section class="panel fleet-list"><div class="panel-header"><div><h2>Next in line</h2><p>Actionable comments come first, then newest pull requests. Each agent finishes its current task before taking the newest eligible item.</p></div></div>${queue.length ? queue.slice(0, F.visibleLimit).map((item) => fleetItem(item)).join("") + (queue.length > F.visibleLimit ? `<div class="panel-actions"><span>Showing ${number(F.visibleLimit)} of ${number(queue.length)} matches</span>${button("Show more tasks", "fleet-show-more", "plus", "button-small")}</div>` : "") : empty("check-circle", items.length ? "No work is waiting in this view" : "A clear view of what’s next", currentFleet()?.status === "running" ? "The fleet checks for new requests and reviews changed code. It waits when everything available has already been reviewed." : "Start a fleet to discover pull requests and review comments across your repositories.")}</section>`;
+      body = `${fleetSlots()}<section class="panel fleet-list"><div class="panel-header"><div><h2>Next in line</h2><p>Actionable comments come first, then newest pull requests. Each agent finishes its current task before taking the newest eligible item.</p></div></div>${queue.length ? queue.slice(0, F.visibleLimit).map((item) => fleetItem(item)).join("") + (queue.length > F.visibleLimit ? `<div class="panel-actions"><span>Showing ${number(F.visibleLimit)} of ${number(queue.length)} matches</span>${button("Show more tasks", "fleet-show-more", "plus", "button-small")}</div>` : "") : empty("check-circle", F.search.trim() || F.repoFilter !== "all" ? "No matching work items" : items.length ? "No work is waiting in this view" : "A clear view of what’s next", F.search.trim() || F.repoFilter !== "all" ? "Clear the search and project filter to return to your saved work." : currentFleet()?.status === "running" ? "The fleet checks for new requests and reviews changed code. It waits when everything available has already been reviewed." : "Your saved results are in Results & history. Resume this fleet when you want it to discover new work.", F.search.trim() || F.repoFilter !== "all" ? button("Clear filters", "recovery-filter-clear", "refresh") : "")}</section>`;
     } else if (F.tab === "ready") {
       const rows = fleetFiltered(ready);
-      body = `<section class="panel fleet-list"><div class="panel-header"><div><h2>${F.error ? "Last recorded merge candidates" : "Ready for your merge decision"}</h2><p>${F.error ? "These were recorded earlier. Their current merge conditions could not be checked. Open GitHub to inspect the latest state." : "These requests have a current review and verified merge conditions. Open an item to merge it on GitHub, then delete its branch there."}</p></div></div>${info("Drafts, changed code, unresolved findings, missing checks, unknown merge conditions and required approvals keep a request out of this list. A different agent reviews a correction; all agents share the connected GitHub identity, so this does not create a second person’s approval.")}${rows.length ? rows.map((item) => fleetItem(item, true)).join("") : empty("pr", ready.length ? "No matching merge candidates" : "Nothing is ready to merge yet", ready.length ? "Clear the search or repository filter to see other items." : "Agents will review new pull requests and work through their findings. Open comments shows what still needs attention.")}</section>`;
+      body = `<section class="panel fleet-list"><div class="panel-header"><div><h2>${F.error ? "Last recorded merge candidates" : "Ready for your merge decision"}</h2><p>${F.error ? "These were recorded earlier. Their current merge conditions could not be checked. Open GitHub to inspect the latest state." : "These pull requests passed review and checks. FatChin cannot merge them. Open one on GitHub, merge it yourself, then delete its branch there if you want."}</p></div></div>${info("Drafts, changed code, unresolved findings, missing checks, unknown merge conditions and required approvals keep a request out of this list. A different agent reviews a correction; all agents share the connected GitHub identity, so this does not create a second person’s approval.")}${rows.length ? rows.map((item) => fleetItem(item, true)).join("") : empty("pr", ready.length ? "No matching merge candidates" : "Nothing is ready for you to merge", ready.length ? "Clear the search or repository filter to see other items." : "When a pull request passes review and checks, it shows up here for you to merge on GitHub. FatChin never merges it.")}</section>`;
     } else if (F.tab === "comments") {
       const rows = fleetFiltered(comments);
-      body = `<section class="panel fleet-list"><div class="panel-header"><div><h2>Feedback with a next step</h2><p>The next free agent picks up an actionable comment, changes only what it asks for, and sends the correction to another agent for review.</p></div></div>${info("Follow Source comment → Correction pull request → Independent review. A comment stays open until its intended correction is confirmed merged. Unclear feedback or missing project checks is held for attention.")}${rows.length ? rows.map((item) => fleetItem(item)).join("") : empty("issue", comments.length ? "No matching comments" : "No open findings in this view", comments.length ? "Try another search or repository filter." : "Actionable review feedback will appear here with its status and links to the correction.")}</section>`;
+      body = `<section class="panel fleet-list"><div class="panel-header"><div><h2>Feedback with a next step</h2><p>The next free agent picks up an actionable comment, changes only what it asks for, and sends the correction to another agent for review.</p></div></div>${info("Follow Source comment → Correction pull request → Independent review. A comment stays open until its intended correction is confirmed merged. Unclear feedback or missing project checks is held for attention.")}${rows.length ? rows.slice(0,F.visibleLimit).map((item) => fleetItem(item)).join("") + (rows.length>F.visibleLimit ? `<div class="panel-actions"><span>Showing ${number(F.visibleLimit)} of ${number(rows.length)} comments.</span>${button("Show more comments","fleet-show-more","plus","button-small")}</div>` : "") : empty("issue", comments.length ? "No matching comments" : "No open findings in this view", comments.length ? "Try another search or repository filter." : "Actionable review feedback will appear here with its status and links to the correction.")}</section>`;
+    } else if (F.tab === "history" || F.tab === "archived") {
+      const rows = fleetFiltered(items.filter(item => F.tab === "archived" ? Boolean(item.archived_at) : !item.archived_at && ["done", "dismissed"].includes(item.status))).sort((a,b) => new Date(b.updated_at||0)-new Date(a.updated_at||0));
+      body = `<section class="panel fleet-list"><div class="panel-header"><div><h2>${F.tab === "archived" ? "Archived work, with its evidence kept" : "Completed reviews and saved results"}</h2><p>${F.tab === "archived" ? "Restore returns an item to the working list without running it again." : "Read any review, its checks, proposed changes, and the reasons it still needs a merge decision."}</p></div></div>${rows.length ? rows.slice(0,F.visibleLimit).map(item => fleetItem(item)).join("") + (rows.length>F.visibleLimit ? button("Show more saved items","fleet-show-more","plus") : "") : empty("folder","No matching saved items","Clear the filters or choose another window. Your original records are kept.",button("Clear filters","recovery-filter-clear","refresh"))}</section>`;
     } else {
       const selected = currentFleet();
-      const events = list(F.data.events).filter((event) => !F.setup.account || !event.fleet_id || event.fleet_id === selected?.id).slice().reverse().slice(0, 100);
-      body = `<section class="panel"><div class="panel-header"><div><h2>Work and automatic recovery</h2><p>Resets, retries and task handoffs are recorded here. Repeated failures stay visible while other agents continue.</p></div></div>${events.length ? `<ol class="fleet-events">${events.map((event) => `<li><div>${icon("clock")}<time>${esc(date(event.at))}</time>${event.slot ? `<span>Agent ${esc(event.slot)}</span>` : ""}</div><p>${esc(event.message)}</p></li>`).join("")}</ol>` : empty("clock", "Activity will appear here", "Starting a fleet records discovery, work and recovery in this view.")}</section>`;
+      const events = list(F.data.events).filter((event) => (!F.setup.account || !event.fleet_id || event.fleet_id === selected?.id) && (F.repoFilter === 'all' || (event.repo || items.find(i => i.id === event.item_id)?.repo) === F.repoFilter) && (!F.search.trim() || [event.message,event.item_id,event.repo,items.find(i => i.id === event.item_id)?.repo].join(' ').toLowerCase().includes(F.search.trim().toLowerCase()))).slice().reverse();
+      body = `<section class="panel"><div class="panel-header"><div><h2>Work and automatic recovery</h2><p>Resets, retries and task handoffs are recorded here. Repeated failures stay visible while other agents continue.</p></div></div>${events.length ? `<ol class="fleet-events">${events.slice(0,F.visibleLimit).map((event) => `<li><div>${icon("clock")}<time>${esc(date(event.at))}</time>${event.slot ? `<span>Agent ${esc(event.slot)}</span>` : ""}</div><p>${esc(event.message)}</p>${event.item_id ? button("Open this work item", "fleet-open-item", "arrow", "button-small", `data-id="${esc(event.item_id)}"`) : ""}</li>`).join("")}</ol>${events.length>F.visibleLimit ? button("Show more activity", "fleet-show-more", "plus") : ""}` : empty("clock", "Activity will appear here", "Starting a fleet records discovery, work and recovery in this view.")}</section>`;
     }
-    return `${fleetNotice()}${F.data.usage ? `<div class="fleet-usage" aria-label="Fleet model calls today"><span>Model calls today</span><strong>GLM ${number(F.data.usage.glm?.calls_today)}</strong><strong>DeepSeek ${number(F.data.usage.deepseek?.calls_today)}</strong></div>` : ""}<div class="fleet-tabs" role="tablist" aria-label="Fleet windows">${tabs.map(([id, title, symbol, count]) => `<button id="fleet-tab-${id}" type="button" class="fleet-tab${F.tab === id ? " active" : ""}" role="tab" aria-selected="${F.tab === id}" aria-controls="fleet-panel" tabindex="${F.tab === id ? 0 : -1}" data-action="fleet-tab" data-tab="${id}">${icon(symbol)}${esc(title)}${count != null ? `<span class="count">${number(count)}</span>` : ""}</button>`).join("")}</div><div id="fleet-panel" role="tabpanel" aria-labelledby="fleet-tab-${esc(F.tab)}">${body}</div>`;
+    return `${fleetNotice()}${cooldownNotice()}${F.data.usage ? `<div class="fleet-usage" aria-label="Fleet model calls today"><span>Model calls today</span><strong>GLM ${number(F.data.usage.glm?.calls_today)}</strong><strong>DeepSeek ${number(F.data.usage.deepseek?.calls_today)}</strong></div>` : ""}<div class="fleet-tabs" role="tablist" aria-label="Fleet windows">${tabs.map(([id, title, symbol, count]) => `<button id="fleet-tab-${id}" type="button" class="fleet-tab${F.tab === id ? " active" : ""}" role="tab" aria-selected="${F.tab === id}" aria-controls="fleet-panel" tabindex="${F.tab === id ? 0 : -1}" data-action="fleet-tab" data-tab="${id}">${icon(symbol)}${esc(title)}${count != null ? `<span class="count">${number(count)}</span>` : ""}</button>`).join("")}</div><div id="fleet-panel" role="tabpanel" aria-labelledby="fleet-tab-${esc(F.tab)}">${body}</div>`;
   }
   function fleetControls() {
     const f = currentFleet(), status = f?.status;
     const running = ["running", "active", "pausing"].includes(status);
-    return `<div class="fleet-control-summary"><div>${f ? `${fleetStatus(status)}<span>${esc(f.account)} · ${f.scope === "all" ? "All accessible writable repositories" : `${list(f.repos).length} selected repositories`} · Up to ${number(Number(f.workers || 0) + Number(f.deepseek_workers || 0))} agents</span>` : '<span>Choose your account and results folder to start.</span>'}</div><div class="heading-actions">${running ? button("Pause after current tasks", "fleet-pause", "pause", "", `data-id="${esc(f.id)}"${F.busy ? " disabled" : ""}`) : f && ["paused", "stopped"].includes(status) ? button("Resume fleet", "fleet-resume", "play", "button-primary", `data-id="${esc(f.id)}"${F.busy ? " disabled" : ""}`) : ""}${f && !["stopped"].includes(status) ? button("Stop now", "fleet-stop", "stop", "button-danger-quiet", `data-id="${esc(f.id)}"${F.busy ? " disabled" : ""}`) : ""}${button("Refresh fleet", "fleet-refresh", "refresh", "button-quiet", F.loading || F.busy ? "disabled" : "")}</div></div>`;
+    return `<div class="fleet-control-summary"><div>${f ? `${fleetStatus(status)}<span>${esc(f.account)} · ${f.scope === "all" ? "All accessible writable repositories" : `${list(f.repos).length} selected repositories`} · Up to ${number(Number(f.workers || 0) + Number(f.deepseek_workers || 0))} agents</span>` : '<span>Choose your account and results folder to start.</span>'}</div><div class="heading-actions">${running ? button("Pause after current tasks", "fleet-pause", "pause", "", `data-id="${esc(f.id)}"${F.busy ? " disabled" : ""}`) : f && ["paused", "stopped"].includes(status) ? button("Resume fleet", "fleet-resume", "play", "button-primary", `data-id="${esc(f.id)}"${F.busy ? " disabled" : ""}`) : ""}${f && !["stopped"].includes(status) ? button("Stop now", "fleet-stop", "stop", "button-danger-quiet", `data-id="${esc(f.id)}"${F.busy ? " disabled" : ""}`) : ""}${f?.max_calls_total && Number(f.calls_used) >= Number(f.max_calls_total) ? button("Choose an additional call budget", "recovery-budget", "spark", "", `data-fleet-id="${esc(f.id)}"`) : ""}${button("Refresh fleet", "fleet-refresh", "refresh", "button-quiet", F.loading || F.busy ? "disabled" : "")}</div></div>`;
   }
   function renderFleet() {
     const f = currentFleet();
     const github = F.data?.github || A.state.github || {};
     const known = [...new Set([...list(A.state.repos).map(repoName), ...watchedRepositories().map((r) => r.repo), ...list(F.data?.items).map((r) => r.repo), ...F.setup.repos].filter(Boolean))].sort();
     const chosen = F.setup.scope === "selected";
-    return `${pageHeading("Your agent fleet", "Twenty helping hands. Every project. One place to follow the work.")}<div class="fleet-intro"><div><p class="eyebrow">CONTINUOUS GITHUB CARE</p><h2>Review. Fix. Review again.</h2><p>Dispatch ten GLM agents and ten DeepSeek agents across your accessible projects. They work through feedback, review the newest requests first, and keep checking changed code while you focus elsewhere.</p></div><div class="fleet-identity">${icon("github")}<div><strong>${esc(github.login ? `Connected as ${github.login}` : "GitHub connection not confirmed")}</strong><span>GLM + DeepSeek · Up to 20 at once</span><span>Uses this installation’s connected GitHub account</span></div></div></div><section class="panel fleet-setup"><div class="panel-header"><div><h2>Choose where your fleet works</h2><p>All writable projects are included by default. At most four agents work in one repository; a full fleet spans at least five. Reports belong in your own folder.</p></div>${f && f.status !== "stopped" ? button(F.setupExpanded ? "Hide setup" : "Review setup", "fleet-setup-toggle", "settings", "button-small", `aria-expanded="${F.setupExpanded}" aria-controls="fleet-start-form"`) : '<span class="badge">Ready to set up</span>'}</div><form id="fleet-start-form" class="panel-body"${f && f.status !== "stopped" && !F.setupExpanded ? " hidden" : ""}><div class="field-grid"><div class="field"><label for="fleet-account">Your member account</label><select id="fleet-account" required><option value="">Choose your account…</option>${list(A.state.accounts).map((account) => `<option value="${esc(account.account)}"${F.setup.account === account.account ? " selected" : ""}>${esc(account.account)}</option>`).join("")}</select><span class="field-hint">Select the account that owns your results folder.</span></div>${[["glm", "fleet-workers", "GLM agents", "workers"], ["deepseek", "fleet-deepseek-workers", "DeepSeek agents", "deepseek_workers"]].map(([id, inputId, label, key]) => { const provider = list(F.data?.providers).find((p) => p.id === id); return `<div class="field"><label for="${inputId}">${label} working at once</label><select id="${inputId}">${Array.from({length: 11}, (_, i) => `<option value="${i}"${Number(F.setup[key]) === i ? " selected" : ""}>${i}${i === 10 ? " — full pool" : i === 0 ? " — do not dispatch" : i === 1 ? " — one task at a time" : ""}</option>`).join("")}</select><span class="field-hint">${esc(provider?.model_id || (id === "glm" ? "GLM-5.3-flash" : "DeepSeek v4.1 flash 1017"))}. A fresh worker starts for each task and retires afterward.</span>${provider?.available === false ? `<span class="field-error">${esc(provider.error || "This provider is unavailable. Choose zero for this pool until the connection is ready.")}</span>` : ""}</div>`; }).join("")}<div class="field fleet-destination"><label for="fleet-destination">Save reports in</label><div class="input-action"><input id="fleet-destination" value="${esc(F.setup.output_dir)}" placeholder="Choose an existing folder in your account" required autocomplete="off">${button("Browse folders", "fleet-browse", "folder", "", !F.setup.account ? "disabled" : "")}</div><span class="field-hint">Choose or create a project folder with Browse folders. Nothing starts until this destination is checked.</span></div><div class="field fleet-scope"><label for="fleet-scope">Repositories to include</label><select id="fleet-scope"><option value="all"${!chosen ? " selected" : ""}>All accessible writable repositories</option><option value="selected"${chosen ? " selected" : ""}>Choose several repositories</option></select><span class="field-hint">Includes projects you own, collaborate on, or can write to through an organization. New accessible projects join future scans.</span></div></div>${chosen ? `<div class="fleet-repo-selection"><label for="fleet-repo-query" class="field-label">Find repositories to include</label><div class="input-action"><input id="fleet-repo-query" value="${esc(F.repoQuery)}" placeholder="Repository name or owner" autocomplete="off">${button("Search GitHub", "fleet-search-repos", "search", "", F.searching ? "disabled" : "")}</div><div id="fleet-repo-results">${fleetRepoOptions()}</div></div>` : ""}<div class="field fleet-dry-run"><label for="fleet-dry-run"><input type="checkbox" id="fleet-dry-run"${F.setup.dry_run ? " checked" : ""}> Dry run — plan and verify, write nothing to GitHub</label><span class="field-hint">Reviews, checks and the exact comments or pull requests it would send are recorded in your report folder. No comment, push, pull request or branch change is sent.</span></div><div class="fleet-start-footer"><p><strong>Dry run is on by default.</strong> Starting authorizes reviews, narrow comment fixes and correction pull requests in that mode; nothing is sent to GitHub. Uncheck it only after the recorded actions match what you would approve. You make the merge decision. Known project types use their recognized checks. If FatChin cannot identify a check, add the project’s verification command from its waiting item.</p><button id="fleet-start" type="submit" class="button button-primary"${F.busy || F.loading || (f && !["stopped"].includes(f.status)) ? " disabled" : ""}>${icon("play")}Dispatch ${number(F.setup.workers + F.setup.deepseek_workers)} agents</button></div>${f && f.status !== "stopped" ? '<p class="field-hint">Your fleet is already configured. Stop it before dispatching a replacement with different settings.</p>' : ""}</form><div id="fleet-controls" class="panel-body fleet-controls">${fleetControls()}</div></section><div class="fleet-explainer"><div>${icon("refresh")}<span><strong>Recovery is automatic.</strong> A crashed worker resets itself. Every new task gets a fresh process and conversation. Repeated failures are shown for attention while healthy agents continue.</span></div><div>${icon("shield")}<span><strong>You stay in charge of merging.</strong> Pause finishes current tasks. Stop blocks new writes; a request already sent to GitHub may still finish.</span></div></div><div class="fleet-window-filter"><div class="search-input">${icon("search")}<input id="fleet-search" type="search" value="${esc(F.search)}" placeholder="Search this window" aria-label="Search fleet items"></div><div class="field"><label for="fleet-repo-filter" class="sr-only">Filter by repository</label><select id="fleet-repo-filter"><option value="all">Every repository</option>${known.map((repo) => `<option value="${esc(repo)}"${F.repoFilter === repo ? " selected" : ""}>${esc(repo)}</option>`).join("")}</select></div><span id="fleet-updated" class="field-hint">${F.lastGood ? `Updated ${esc(ago(F.lastGood))}` : "Waiting for fleet status"}</span></div><div id="fleet-monitor">${fleetWindow()}</div>`;
+    return `${pageHeading("Your agent fleet", "Twenty helping hands. Every project. One place to follow the work.")}<div class="fleet-intro"><div><p class="eyebrow">CONTINUOUS GITHUB CARE</p><h2>Review. Fix. Review again.</h2><p>Dispatch ten GLM agents and ten DeepSeek agents across your accessible projects. They work through feedback, review the newest requests first, and keep checking changed code while you focus elsewhere.</p></div><div class="fleet-identity">${icon("github")}<div><strong>${esc(github.login ? `Connected as ${github.login}` : "GitHub connection not confirmed")}</strong><span>GLM + DeepSeek · Up to 20 at once</span><span>Uses this installation’s connected GitHub account</span></div></div></div><section class="panel fleet-setup"><div class="panel-header"><div><h2>Choose where your fleet works</h2><p>All writable projects are included by default. At most four agents work in one repository; a full fleet spans at least five. Reports belong in your own folder.</p></div>${f && f.status !== "stopped" ? button(F.setupExpanded ? "Hide setup" : "Review setup", "fleet-setup-toggle", "settings", "button-small", `aria-expanded="${F.setupExpanded}" aria-controls="fleet-start-form"`) : '<span class="badge">Ready to set up</span>'}</div><form id="fleet-start-form" class="panel-body"${f && f.status !== "stopped" && !F.setupExpanded ? " hidden" : ""}><div class="field-grid"><div class="field"><label for="fleet-account">Your member account</label><select id="fleet-account" required><option value="">Choose your account…</option>${list(A.state.accounts).map((account) => `<option value="${esc(account.account)}"${F.setup.account === account.account ? " selected" : ""}>${esc(account.account)}</option>`).join("")}</select><span class="field-hint">Select the account that owns your results folder.</span></div>${[["glm", "fleet-workers", "GLM agents", "workers"], ["deepseek", "fleet-deepseek-workers", "DeepSeek agents", "deepseek_workers"]].map(([id, inputId, label, key]) => { const provider = list(F.data?.providers).find((p) => p.id === id); return `<div class="field"><label for="${inputId}">${label} working at once</label><select id="${inputId}">${Array.from({length: 11}, (_, i) => `<option value="${i}"${Number(F.setup[key]) === i ? " selected" : ""}>${i}${i === 10 ? " — full pool" : i === 0 ? " — do not dispatch" : i === 1 ? " — one task at a time" : ""}</option>`).join("")}</select><span class="field-hint">${esc(provider?.model_id || (id === "glm" ? "GLM-5.3-flash" : "DeepSeek v4.1 flash 1017"))}. A fresh worker starts for each task and retires afterward.</span>${provider?.available === false ? `<span class="field-error">${esc(provider.error || "This provider is unavailable. Choose zero for this pool until the connection is ready.")}</span>` : ""}</div>`; }).join("")}<div class="field fleet-destination"><label for="fleet-destination">Save reports in</label><div class="input-action"><input id="fleet-destination" value="${esc(F.setup.output_dir)}" placeholder="Choose an existing folder in your account" required autocomplete="off">${button("Browse folders", "fleet-browse", "folder", "", !F.setup.account ? "disabled" : "")}</div><span class="field-hint">Choose or create a project folder with Browse folders. Nothing starts until this destination is checked.</span></div><div class="field fleet-scope"><label for="fleet-scope">Repositories to include</label><select id="fleet-scope"><option value="all"${!chosen ? " selected" : ""}>All accessible writable repositories</option><option value="selected"${chosen ? " selected" : ""}>Choose several repositories</option></select><span class="field-hint">Includes projects you own, collaborate on, or can write to through an organization. New accessible projects join future scans.</span></div></div>${chosen ? `<div class="fleet-repo-selection"><label for="fleet-repo-query" class="field-label">Find repositories to include</label><div class="input-action"><input id="fleet-repo-query" value="${esc(F.repoQuery)}" placeholder="Repository name or owner" autocomplete="off">${button("Search GitHub", "fleet-search-repos", "search", "", F.searching ? "disabled" : "")}</div><div id="fleet-repo-results">${fleetRepoOptions()}</div></div>` : ""}<div class="field fleet-dry-run"><label for="fleet-dry-run"><input type="checkbox" id="fleet-dry-run"${F.setup.dry_run ? " checked" : ""}> Dry run — plan and verify, write nothing to GitHub</label><span class="field-hint">Reviews, checks and the exact comments or pull requests it would send are recorded in your report folder. No comment, push, pull request or branch change is sent.</span></div><div class="fleet-start-footer"><p><strong>Dry run is on by default.</strong> Starting authorizes reviews, narrow comment fixes and correction pull requests in that mode; nothing is sent to GitHub. Uncheck it only after the recorded actions match what you would approve. You make the merge decision. Known project types use their recognized checks. If FatChin cannot identify a check, add the project’s verification command from its waiting item.</p><button id="fleet-start" type="submit" class="button button-primary"${F.busy || F.loading || (f && !["stopped"].includes(f.status)) ? " disabled" : ""}>${icon("play")}Dispatch ${number(F.setup.workers + F.setup.deepseek_workers)} agents</button></div>${f && f.status !== "stopped" ? '<p class="field-hint">Your fleet is already configured. Stop it before dispatching a replacement with different settings.</p>' : ""}</form><div id="fleet-controls" class="panel-body fleet-controls">${fleetControls()}</div></section><div class="fleet-explainer"><div>${icon("refresh")}<span><strong>Recovery is automatic.</strong> A crashed worker resets itself. Every new task gets a fresh process and conversation. Repeated failures are shown for attention while healthy agents continue.</span></div><div>${icon("shield")}<span><strong>You merge. FatChin never does.</strong> Pause finishes current tasks. Stop blocks new writes; a request already sent to GitHub may still finish.</span></div></div><div class="fleet-window-filter"><div class="search-input">${icon("search")}<input id="fleet-search" type="search" value="${esc(F.search)}" placeholder="Search this window" aria-label="Search fleet items"></div><div class="field"><label for="fleet-repo-filter" class="sr-only">Filter by repository</label><select id="fleet-repo-filter"><option value="all">Every repository</option>${known.map((repo) => `<option value="${esc(repo)}"${F.repoFilter === repo ? " selected" : ""}>${esc(repo)}</option>`).join("")}</select></div><span id="fleet-updated" class="field-hint">${F.lastGood ? `Updated ${esc(ago(F.lastGood))}` : "Waiting for fleet status"}</span></div><div id="fleet-monitor">${fleetWindow()}</div>`;
   }
   function fleetRepoOptions() {
     const options = new Map([...F.setup.repos.map((full_name) => ({full_name})), ...F.repoResults].map((r) => [r.full_name, r]));
@@ -1326,7 +1424,7 @@
     const version = F.version, initialLoad = !F.data;
     F.loading = (async () => {
       try { const data = await api("/api/fleet"); if (version === F.version) {F.data = data; restoreFleetSetup(); F.error = ""; F.lastGood = new Date().toISOString();} }
-      catch (error) { if (version === F.version) F.error = error.message; }
+      catch (error) { if (version === F.version) F.error = errorMessage(error); }
       finally { F.loading = null; if (initialLoad && F.data && A.view === "fleet") renderView(); else updateFleetMonitor(); }
     })();
     updateFleetMonitor();
@@ -1342,17 +1440,18 @@
       F.lastGood = new Date().toISOString();
       if (action === "start") F.setupExpanded = false;
       if (action === "stop") F.setupExpanded = true;
-      toast(({start: "Fleet dispatched. Follow its work below.", pause: "Pause requested. Current tasks can finish.", resume: "Fleet resumed.", stop: "Stop requested. Requests already sent to GitHub may still finish.", retry: "Retry requested. The item keeps its history.", refresh: "A fresh scan has been requested.", configure_checks: "Project checks saved. Waiting fixes will be picked up automatically."})[action] || "Fleet updated.");
-    } catch (error) { F.error = error.message; }
+      toast(({start: "Fleet dispatched. Follow its work below.", pause: "Pause requested. Current tasks can finish.", resume: "Fleet resumed.", stop: "Stop requested. Requests already sent to GitHub may still finish.", retry: "Retry requested. The item keeps its history.", refresh: "A fresh scan has been requested.", configure_checks: "Project checks saved. A paused or stopped fleet stays paused or stopped until you choose to resume it."})[action] || "Fleet updated.");
+    } catch (error) { F.error = errorMessage(error); }
     finally { F.busy = false; if (A.view === "fleet" || (A.view === "settings" && !A.settingsDirty)) renderView(); }
   }
   function restoreFleetSetup() {
     if (F.setup.account) return;
-    const existing = list(F.data?.fleets).find((f) => f.status !== "stopped");
+    const existing = list(F.data?.fleets).find((f) => f.status !== "stopped") || list(F.data?.fleets)[0];
     if (!existing) return;
     Object.assign(F.setup, {account: existing.account, output_dir: existing.output_dir || "", scope: existing.scope || "all",
       repos: [...list(existing.repos)], workers: Number(existing.workers || 0), deepseek_workers: Number(existing.deepseek_workers || 0)});
-    F.setupExpanded = false;
+    F.setup.dry_run = Boolean(existing.dry_run);
+    F.setupExpanded = existing.status === "stopped";
   }
   function bindFleet() {
     if (!F.data && !F.loading && !F.error) loadFleet();
@@ -1385,21 +1484,21 @@
       F.setup.repos = event.target.checked ? [...new Set([...F.setup.repos, repo])] : F.setup.repos.filter((r) => r !== repo);
       const root = $("#fleet-repo-results"), restore = rememberFocus(root); root.innerHTML = fleetRepoOptions(); restore();
     });
-    $("#fleet-search")?.addEventListener("input", (event) => {F.search = event.target.value; F.visibleLimit = 200; updateFleetMonitor();});
+    $("#fleet-search")?.addEventListener("input", (event) => {F.search = event.target.value; F.visibleLimit = 50; updateFleetMonitor();});
     $("#fleet-repo-filter")?.addEventListener("change", (event) => {F.repoFilter = event.target.value; updateFleetMonitor();});
     $("#fleet-monitor")?.addEventListener("keydown", (event) => {
       if (!event.target.matches('[role="tab"]') || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
       event.preventDefault();
-      const ids = ["agents", "ready", "comments", "activity"], index = ids.indexOf(F.tab);
+      const ids = ["agents", "ready", "comments", "history", "archived", "activity"], index = ids.indexOf(F.tab);
       F.tab = event.key === "Home" ? ids[0] : event.key === "End" ? ids[3] : ids[(index + (event.key === "ArrowRight" ? 1 : -1) + ids.length) % ids.length];
       updateFleetMonitor(); $("#fleet-tab-" + F.tab).focus();
     });
   }
   async function fleetAction(element) {
     const action = element.dataset.action;
-    if (action === "fleet-open-item") {F.tab = "agents"; F.search = element.dataset.title || element.dataset.repo || ""; F.repoFilter = element.dataset.repo || "all"; F.visibleLimit = 200; location.hash = "fleet"; if (A.view === "fleet") renderView(); return;}
+    if (action === "fleet-open-item") return showFleetDetail(element.dataset.id);
     if (action === "fleet-setup-toggle") {F.setupExpanded = !F.setupExpanded; renderView(); return;}
-    if (action === "fleet-show-more") {F.visibleLimit += 200; updateFleetMonitor(); return;}
+    if (action === "fleet-show-more") {F.visibleLimit += 50; updateFleetMonitor(); return;}
     if (action === "fleet-tab") {F.tab = element.dataset.tab; updateFleetMonitor(); return;}
     if (action === "fleet-browse") return browseFolders(F.setup.account, F.setup.output_dir, (path) => {F.setup.output_dir = path; if ($("#fleet-destination")) $("#fleet-destination").value = path;});
     if (action === "fleet-refresh") {if (!F.data) return loadFleet(); return mutateFleet("refresh", currentFleet() ? {fleet_id: currentFleet().id} : {});}
@@ -1407,7 +1506,9 @@
       const repo = element.dataset.repo;
       const config = list(A.state.repos).find((r) => repoName(r) === repo);
       const item = list(F.data?.items).find((r) => r.id === element.dataset.id);
-      openDialog("Set this project’s verification command", "CONTINUE A WAITING FIX", `<p class="dialog-copy">FatChin checks a correction before publishing it. Save the command you normally use to test <strong>${esc(repo)}</strong>; waiting fixes will resume automatically after the checks are saved.</p>${item?.error ? info(esc(item.error), "warning") : ""}<form id="fleet-checks-form"><div class="field"><label for="fleet-checks-command">Command that checks this project</label><textarea id="fleet-checks-command" rows="4" required placeholder="For example: npm test">${esc(list(config?.checks).join("\n"))}</textarea><span class="field-hint">Use a command from the project’s documentation. Examples: <code>npm test</code>, <code>python -m pytest</code>, or <code>cargo test</code>. Put separate commands on separate lines. These commands run in an isolated copy of this project.</span></div><div class="field spaced-top"><label for="fleet-checks-base">Default branch, if known</label><input id="fleet-checks-base" value="${esc(config?.base_branch || "")}" placeholder="Leave empty to use GitHub’s default branch"><span class="field-hint">A branch is a line of saved work, often called main or master.</span></div></form>`, `${button("Cancel", "dialog-close")}<button class="button button-primary" type="submit" form="fleet-checks-form">${icon("check")}Save and continue</button>`);
+      const fleet = [...list(F.data?.fleets), ...list(workspaceFleet().fleets)].find(f => f.id === item?.fleet_id) || currentFleet();
+      const held = fleet && ["stopped", "paused"].includes(fleet.status);
+      openDialog("Set this project’s verification command", "CONTINUE A WAITING FIX", `<p class="dialog-copy">FatChin checks a correction before publishing it. Save the command you normally use to test <strong>${esc(repo)}</strong>. ${held ? `This fleet is ${esc(fleet.status)}. Saving commands leaves it ${esc(fleet.status)}; review resuming the fleet when you want work to continue.` : "A running fleet can pick up waiting fixes after you save. Saving commands does not start a paused or stopped fleet."}</p>${item?.error ? info(esc(item.error), "warning") : ""}<form id="fleet-checks-form"><div class="field"><label for="fleet-checks-command">Command that checks this project</label><textarea id="fleet-checks-command" rows="4" required placeholder="For example: npm test">${esc(list(config?.checks).join("\n"))}</textarea><span class="field-hint">Use a command from the project’s documentation. Examples: <code>npm test</code>, <code>python -m pytest</code>, or <code>cargo test</code>. Put separate commands on separate lines. These commands run in an isolated copy of this project.</span></div><div class="field spaced-top"><label for="fleet-checks-base">Default branch, if known</label><input id="fleet-checks-base" value="${esc(config?.base_branch || "")}" placeholder="Leave empty to use GitHub’s default branch"><span class="field-hint">A branch is a line of saved work, often called main or master.</span></div></form>`, `${button("Cancel", "dialog-close")}<button class="button button-primary" type="submit" form="fleet-checks-form">${icon("check")}Save check commands</button>`);
       const version = A.dialogVersion;
       $("#fleet-checks-form").addEventListener("submit", async (event) => {
         event.preventDefault();
@@ -1419,7 +1520,13 @@
         await mutateFleet("configure_checks", payload);
         if (!currentDialog(version)) return;
         if (F.error) dialogError(new Error(F.error));
-        else {closeDialog(); refresh(false);}
+        else {
+          const savedFleet = list(F.data?.fleets).find(f => f.id === fleet?.id) || fleet;
+          if (savedFleet && ["stopped", "paused"].includes(savedFleet.status)) {
+            openDialog("Check commands saved", "CHOOSE WHEN TO CONTINUE", `<p>The verification command for <strong>${esc(repo)}</strong> is saved. Your fleet is still ${esc(savedFleet.status)}. Its saved runs and results are kept. Review resuming the fleet when you want automatic work to continue.</p>`, `${button("Close","dialog-close")}${button("Review resuming fleet","recovery-review-resume","play","button-primary",`data-fleet-id="${esc(savedFleet.id)}"`)}`);
+          } else closeDialog();
+          refresh(false);
+        }
       });
       return;
     }
@@ -1429,10 +1536,11 @@
       if (!q) {F.repoError = "Enter a repository name or owner to search."; $("#fleet-repo-results").innerHTML = fleetRepoOptions(); return;}
       F.searching = true; F.repoError = ""; $("#fleet-repo-results").innerHTML = fleetRepoOptions();
       try {const reply = await api(`/api/github/repositories?${query({q})}`); F.repoResults = list(reply.items); if (!F.repoResults.length) F.repoError = "No accessible repositories matched. Try the owner or a shorter name.";}
-      catch (error) {F.repoError = error.message;}
+      catch (error) {F.repoError = errorMessage(error);}
       finally {F.searching = false; if ($("#fleet-repo-results")) $("#fleet-repo-results").innerHTML = fleetRepoOptions();}
       return;
     }
+    if (action === "fleet-resume") return reviewFleetResume(element.dataset.id);
     const operation = {"fleet-pause": "pause", "fleet-resume": "resume", "fleet-stop": "stop", "fleet-retry": "retry"}[action];
     if (operation) return mutateFleet(operation, action === "fleet-retry" ? {item_id: element.dataset.id, fleet_id: element.dataset.fleetId} : {fleet_id: element.dataset.id});
   }
@@ -1495,6 +1603,17 @@
       $("#settings-save-hint").textContent = "You have unsaved changes.";
     });
     $("#settings-form")?.addEventListener("submit", saveSettings);
+    $("#provider-source-form")?.addEventListener("submit", event => {
+      event.preventDefault();
+      busy($("#provider-source-form button[type=submit]"), async () => {
+        try {
+          const reply = await api("/api/provider-source", {provider: "deepseek", source: $("#deepseek-source").value});
+          await refresh(true);
+          const status = $("#provider-source-status");
+          if (status) status.innerHTML = info(esc(reply.hint || "Connection choice saved. Restart the idle worker in Worker controls, then test it."));
+        } catch (error) { reportError(error); }
+      });
+    });
     $("#command-user-add")?.addEventListener("click", (e) =>
       busy(e.currentTarget, () =>
         addCommandUser($("#command-user-lookup").value.trim()),
@@ -1597,7 +1716,12 @@
       clearTimeout(A.githubTimer);
       A.githubTimer = null;
     }
+    if (A.wizard && !A.wizard.finished) saveWizardDraft();
     dialog.close();
+    // A completed decision must not leave selectable draft fields behind while
+    // the next asynchronous read is in flight.
+    $("#dialog-body").replaceChildren();
+    $("#dialog-footer").replaceChildren();
     A.dialog = null;
     A.wizard = null;
   }
@@ -1656,7 +1780,7 @@
   function preferredTaskType() {
     return taskTypes().find((type) => type.id === "fix-pr") || taskTypes()[0] || null;
   }
-  function newTask(prefill = "") {
+  function newTask(prefill = "", supplied = null) {
     A.wizard = {
       step: 0,
       repo: prefill || "",
@@ -1670,7 +1794,12 @@
       loading: false,
       requestId: 0,
     };
+    const saved = supplied || readWizardDraft();
+    if (saved && (!prefill || saved.repo === prefill)) {
+      Object.assign(A.wizard, saved, {step: 0, loading: false, requestId: 0, target: null, targets: [], resumed: true});
+    }
     renderWizard(true);
+    saveWizardDraft();
     if (!taskTypes().length)
       loadTaskTypes()
         .then(() => {
@@ -1721,7 +1850,7 @@
     w.renderedStep = w.step;
     let body = "";
     if (w.step === 0)
-      body = `<div class="wizard-stack"><p class="dialog-copy" style="margin:0">Start with the project and the kind of work you need.</p><div class="field"><label for="task-repo">${type?.takes === "none" ? "Existing repository (not needed for a new project)" : "Repository"}</label><select id="task-repo"${type?.takes === "none" ? " disabled" : " required"}><option value="">Choose a repository…</option>${repos()
+      body = `<div class="wizard-stack"><p class="dialog-copy" style="margin:0">Start with the project and the kind of work you need.</p>${w.resumed ? info("Your unfinished request has been restored. You can continue it, or clear these entered details to start a different request.") + button("Start a different request", "recovery-fresh-task", "plus", "button-small") : ""}<div class="field"><label for="task-repo">${type?.takes === "none" ? "Existing repository (not needed for a new project)" : "Repository"}</label><select id="task-repo"${type?.takes === "none" ? " disabled" : " required"}><option value="">Choose a repository…</option>${repos()
         .map(
           (r) =>
             `<option value="${esc(repoName(r))}"${w.repo === repoName(r) ? " selected" : ""}>${esc(repoName(r))}</option>`,
@@ -1737,7 +1866,7 @@
               )
               .join("")}</div>`
           : loading("Loading the kinds of work this worker can do")
-      }</div>${type ? taskGuide(type) + taskFieldInputs(type, w) : ""}</div>`;
+      }</div>${type ? taskGuide(type) + taskFieldInputs(type, w) : ""}${w.repo && type?.takes !== "none" && !repos().some(r=>repoName(r)===w.repo) ? info(`This project (${esc(w.repo)}) needs to be added before starting a task. Your request is saved.`, "warning") + button("Add this project and keep my request", "new-repo", "repo") : ""}</div>`;
     if (w.step === 1)
       body = `<div class="wizard-stack"><div class="selection-summary">${icon("repo")}<div><strong>${esc(w.repo)}</strong><small>${esc(type?.label || kindLabel(w.kind))}</small></div></div><div class="field"><label for="task-target">${noun}</label><select id="task-target"><option value="">${w.loading ? "Loading work items…" : w.kind === "cleanup-merged" ? "Choose a finished pull request…" : "Choose an open item…"}</option>${w.targets.map((t) => `<option value="${t.number}"${String(w.number) === String(t.number) ? " selected" : ""}>#${t.number} — ${esc(t.title)}</option>`).join("")}</select><span class="field-hint">${w.kind === "cleanup-merged" ? "Finished pull requests are listed. Choose one that has already merged." : "Open issues or pull requests are listed."} You can also look up a known number below.</span></div><div class="field"><label for="task-number">Look up by number</label><div class="input-action"><input id="task-number" type="number" min="1" step="1" placeholder="For example, 42" value="${esc(w.number)}"><button class="button" id="lookup-target" type="button">${icon("search")}Look up</button></div></div>${w.target ? `<div class="selection-summary">${icon(type?.takes === "pr" ? "pr" : "issue")}<div><strong>#${esc(w.target.number)} · ${esc(w.target.title)}</strong><small>${esc(labelState(w.target.state))}${w.target.headRefName ? ` · ${esc(w.target.headRefName)}` : ""} · <a href="${targetURL(w.repo, w.kind, w.target.number)}" target="_blank" rel="noopener noreferrer">View on GitHub ${icon("external")}</a></small></div></div>` : ""}<div id="target-loading">${w.loading ? loading("Loading open items") : ""}</div></div>`;
     if (w.step === 2)
@@ -1777,13 +1906,13 @@
           : w.kind !== "implement-issue"
             ? ""
             : "<li>After success, the pull request it opens is watched automatically. New inline review feedback can queue further model requests and GitHub updates within the local worker call controls. Remove this in Review watches when no longer needed.</li>"
-      }</ul></div>${!A.state.service?.active ? info("The worker is stopped. Start it from Overview or Settings before queuing a task.", "warning") : ""}</div>`;
+      }</ul></div>${!A.state.service?.active ? info("The worker is stopped. Your request is saved; start it here, then queue this task.", "warning") + button("Start worker and keep my request", "recovery-wizard-start", "play") : ""}${A.state.service?.restart_required ? info("Your request is saved. Apply the saved settings before queuing it.", "warning") + button("Apply settings and keep my request", "recovery-wizard-restart", "refresh") : ""}</div>`;
     }
     if (initial)
       openDialog("Create a task", "A FEW DETAILS, THEN WE’RE OFF", "");
     $("#dialog-body").innerHTML = wizardSteps() + body;
     $("#dialog-footer").innerHTML =
-      `${button(w.step ? "Back" : "Cancel", w.step ? "wizard-back" : "dialog-close", w.step ? "back" : "")}<div class="footer-right">${w.step === 3 ? `<button class="button button-primary" id="queue-task"${A.state.service?.active ? "" : " disabled"}>${icon("play")}Queue task</button>` : button("Continue", "wizard-next", "arrow", "button-primary")}</div>`;
+      `${button(w.step ? "Back" : "Cancel", w.step ? "wizard-back" : "dialog-close", w.step ? "back" : "")}<div class="footer-right">${w.step === 3 ? `<button class="button button-primary" id="queue-task"${A.state.service?.active && !A.state.service?.restart_required ? "" : " disabled"}>${icon("play")}Queue task</button>` : button("Continue", "wizard-next", "arrow", "button-primary")}</div>`;
     $("#task-repo")?.addEventListener("change", (e) => {
       w.requestId++;
       w.loading = false;
@@ -1845,6 +1974,7 @@
             if (value) request[item.name] = value;
           }
           const r = await api("/api/jobs", request);
+          w.finished = true; window.sessionStorage.removeItem("fatchin-task-request"); window.localStorage.removeItem("fatchin-task-request");
           const relevant = currentDialog(version) && A.wizard === w;
           if (relevant) {
             closeDialog();
@@ -1916,6 +2046,7 @@
           throw new Error("Choose the kind of work you need.");
         }
         if (type.takes !== "none" && !w.repo) throw new Error("Choose a repository to continue.");
+        if(type.takes !== "none" && !repos().some(r=>repoName(r)===w.repo))throw new Error("This project needs to be added before work can start. Choose Search GitHub and add a repository above; your request is saved and will return here.");
         for (const item of list(type.fields)) {
           const value = String((w.values || {})[item.name] ?? "").trim();
           if (item.required && !value)
@@ -1993,6 +2124,42 @@
       .join(
         "",
       )}</select><span class="field-hint">Select the account that owns your output folder.</span></div><div class="field"><label for="${prefix}-destination">Destination folder</label><div class="input-action"><input id="${prefix}-destination" value="${esc(obj.output_dir)}" placeholder="Choose a folder in your account" readonly aria-describedby="${prefix}-folder-hint"><button class="button" id="${prefix}-browse" type="button"${obj.account ? "" : " disabled"}>${icon("folder")}Browse folders</button></div><span id="${prefix}-folder-hint" class="field-hint">Use the folder browser to select or create a real folder. Results are written here.</span></div>`;
+  }
+  function watchDestinationFields(obj, prefix) {
+    return `${destinationFields(obj, prefix)}<div id="${prefix}-saved-destinations" class="spaced-top" aria-live="polite"></div>`;
+  }
+  function bindWatchDestination(obj, prefix, selectedRepo) {
+    bindDestination(obj, prefix);
+    const version = A.dialogVersion;
+    let request = 0;
+    const load = async () => {
+      const root = $(`#${prefix}-saved-destinations`), repo = selectedRepo(), account = obj.account;
+      const generation = ++request;
+      if (!root) return;
+      if (!repo) { root.innerHTML = info("Choose a repository above. Then you can reuse a saved results folder, or choose your account and Browse folders."); return; }
+      root.innerHTML = loading("Looking for saved results folders");
+      const relevant = () => root.isConnected && currentDialog(version) && generation === request && repo === selectedRepo() && account === obj.account;
+      try {
+        const reply = await api(`/api/watch-destinations?${query({repo, account: account || undefined})}`);
+        if (!relevant()) return;
+        const choices = list(reply.items);
+        root.innerHTML = `<h3>Choose where this watch saves results</h3><p class="field-hint">${choices.length ? "These folders are already saved in FatChin and can be used now. Choose one explicitly, or use Browse folders to choose another." : "No usable saved folder was found for this selection. Choose your account above, then Browse folders to select or create a results folder inside your account."}</p>${choices.map((choice, index) => `<article class="recovery-card"><p>${esc(choice.source)} · ${esc(choice.account)}</p><p><code>${esc(choice.output_dir)}</code></p><button type="button" class="button button-small" data-watch-destination="${index}">${icon("folder")}Use this saved folder</button></article>`).join("")}<p class="field-hint">Choosing a folder fills this form. Automatic follow-up starts only after you save and enable the watch.</p>`;
+        $$('[data-watch-destination]', root).forEach(button => button.addEventListener('click', () => {
+          const choice = choices[Number(button.dataset.watchDestination)];
+          obj.account = choice.account; obj.output_dir = choice.output_dir;
+          $(`#${prefix}-account`).value = choice.account;
+          $(`#${prefix}-destination`).value = choice.output_dir;
+          $(`#${prefix}-browse`).disabled = false;
+          const notice = document.createElement('p'); notice.className = 'field-hint'; notice.textContent = 'Saved folder selected. Review automatic follow-up and save when ready.';
+          root.querySelector('[data-destination-selected]')?.remove(); notice.dataset.destinationSelected = 'true'; root.append(notice);
+        }));
+      } catch (error) {
+        if (relevant()) root.innerHTML = info(esc([errorMessage(error), "You can still choose your account above and use Browse folders."].join(" ")), "error");
+      }
+    };
+    $(`#${prefix}-account`)?.addEventListener('change', load);
+    load();
+    return load;
   }
   function validateDestination(obj) {
     if (!obj.account) throw new Error("Choose your account.");
@@ -2109,8 +2276,8 @@
       $("#folder-body").innerHTML = empty(
         "alert",
         "This folder could not be opened",
-        error.message,
-        button("Try again", "folder-retry", "refresh"),
+        errorMessage(error),
+        button("Try again", "folder-retry", "refresh") + button("Return to my home folder", "recovery-folder-home", "folder") + recoveryLinks(error.actions),
       );
     }
   }
@@ -2144,7 +2311,7 @@
     openDialog(
       "Task details",
       "YOUR WORK, WITH THE DETAILS",
-      `<div class="detail-top"><div><h3>${esc(notes.title || `${kindLabel(job.kind)}${job.number ? ` #${job.number}` : ""}`)}</h3><p><a href="${targetURL(job.repo_full_name || job.repo, job.kind, job.number)}" target="_blank" rel="noopener noreferrer">${esc(job.repo_full_name || job.repo)} #${esc(job.number)} ${icon("external")}</a></p></div>${jobBadge(job)}</div>${job.error ? `<div class="dialog-error" role="status">${esc(job.error)}</div>` : ""}${notes.result_export_error ? `<div class="banner banner-warning" role="status">${icon("alert")}<div><strong>Local results need attention</strong>${esc(stringify(notes.result_export_error))}${notes.worktree_path ? "<p>The temporary checkout is retained for recovery. Check the recorded worktree location before retrying an export or starting new work.</p>" : ""}</div></div>` : ""}<dl class="detail-grid"><div><dt>Task ID</dt><dd class="mono">${esc(id)}</dd></div><div><dt>Kind</dt><dd>${esc(kindLabel(job.kind))}</dd></div><div><dt>Created</dt><dd>${esc(date(job.created_at))}</dd></div><div><dt>Updated</dt><dd>${esc(date(job.updated_at))}</dd></div><div><dt>Model calls used</dt><dd>${number(job.model_calls_used)}</dd></div><div><dt>Results folder</dt><dd>${esc(output || "Not recorded for this older task")}</dd></div><div><dt>Member account</dt><dd>${esc(notes.member || notes.account || job.account || "Not recorded")}</dd></div><div><dt>Commits produced</dt><dd>${esc(list(job.produced_commits).join(", ") || "None recorded")}</dd></div><div><dt>Worker task state</dt><dd>${esc(labelState(job.state))}</dd></div><div><dt>Temporary checkout</dt><dd>${esc(notes.worktree_path || "Not recorded")}</dd></div></dl>${notes.worktree_cleanup ? `<div class="detail-section"><h3>Temporary checkout cleanup</h3><p>${esc(stringify(notes.worktree_cleanup))}</p></div>` : ""}${list(notes.export_skipped_files).length ? `<div class="detail-section"><h3>Files skipped while saving results</h3><pre>${esc(list(notes.export_skipped_files).map(stringify).join("\n"))}</pre></div>` : ""}${notes.agent_summary ? `<div class="detail-section"><h3>Result summary</h3><p>${esc(stringify(notes.agent_summary))}</p></div>` : ""}${notes.changed_files ? `<div class="detail-section"><h3>Changed files</h3><pre>${esc(list(notes.changed_files).map(stringify).join("\n"))}</pre></div>` : ""}${verification ? `<div class="detail-section"><h3>Verification</h3><pre>${esc(stringify(verification))}</pre>${notes.tested_commit ? `<p>Tested commit: <code>${esc(notes.tested_commit)}</code></p>` : ""}</div>` : ""}${createdPR}${evidence}<div class="detail-section"><h3>Task files</h3><p>Inspect the files recorded for this task. Large file previews may be shortened.</p><div class="spaced-top">${button("Browse task files", "job-files", "folder", "button-small", `data-id="${esc(id)}"`)}</div><div id="job-file-browser" class="spaced-top"></div></div>`,
+      `<div class="detail-top"><div><h3>${esc(notes.title || `${kindLabel(job.kind)}${job.number ? ` #${job.number}` : ""}`)}</h3><p><a href="${targetURL(job.repo_full_name || job.repo, job.kind, job.number)}" target="_blank" rel="noopener noreferrer">${esc(job.repo_full_name || job.repo)}${Number(job.number) > 0 ? ` #${esc(job.number)}` : " · Open project"} ${icon("external")}</a></p></div>${jobBadge(job)}</div>${job.error ? `<div class="dialog-error" role="status">${esc(job.error)}</div>` : ""}${notes.result_export_error ? `<div class="banner banner-warning" role="status">${icon("alert")}<div><strong>Local results need attention</strong>${esc(stringify(notes.result_export_error))}${notes.worktree_path ? "<p>The temporary checkout is retained for recovery. Check the recorded worktree location before retrying an export or starting new work.</p>" : ""}</div></div>` : ""}${taskRecoveryPanel(job)}<dl class="detail-grid"><div><dt>Task ID</dt><dd class="mono">${esc(id)}</dd></div><div><dt>Kind</dt><dd>${esc(kindLabel(job.kind))}</dd></div><div><dt>Created</dt><dd>${esc(date(job.created_at))}</dd></div><div><dt>Updated</dt><dd>${esc(date(job.updated_at))}</dd></div><div><dt>Model calls used</dt><dd>${number(job.model_calls_used)}</dd></div><div><dt>Results folder</dt><dd>${esc(output || "Not recorded for this older task")}</dd></div><div><dt>Member account</dt><dd>${esc(notes.member || notes.account || job.account || "Not recorded")}</dd></div><div><dt>Commits produced</dt><dd>${esc(list(job.produced_commits).join(", ") || "None recorded")}</dd></div><div><dt>Worker task state</dt><dd>${esc(labelState(job.state))}</dd></div><div><dt>Temporary checkout</dt><dd>${esc(notes.worktree_path || "Not recorded")}</dd></div></dl>${notes.worktree_cleanup ? `<div class="detail-section"><h3>Temporary checkout cleanup</h3><p>${esc(stringify(notes.worktree_cleanup))}</p></div>` : ""}${list(notes.export_skipped_files).length || list(notes.recovery_copy_skipped).length ? `<div class="detail-section"><h3>Files skipped while saving results</h3><p>These files were left in their original location. Hidden files and symbolic links are excluded from copies. Read the list before using this saved copy.</p><pre>${esc([...list(notes.export_skipped_files), ...list(notes.recovery_copy_skipped)].map(stringify).join("\n"))}</pre></div>` : ""}${notes.agent_summary ? `<div class="detail-section"><h3>Result summary</h3><p>${esc(stringify(notes.agent_summary))}</p></div>` : ""}${notes.changed_files ? `<div class="detail-section"><h3>Changed files</h3><pre>${esc(list(notes.changed_files).map(stringify).join("\n"))}</pre></div>` : ""}${verification ? `<div class="detail-section"><h3>Verification</h3><pre>${esc(stringify(verification))}</pre>${notes.tested_commit ? `<p>Tested commit: <code>${esc(notes.tested_commit)}</code></p>` : ""}</div>` : ""}${createdPR}${evidence}<div class="detail-section"><h3>Task files</h3><p>Inspect the files recorded for this task. Large file previews may be shortened.</p><div class="spaced-top">${button("Browse task files", "job-files", "folder", "button-small", `data-id="${esc(id)}"`)}</div><div id="job-file-browser" class="spaced-top"></div></div>`,
       `${button("Close", "dialog-close")}<div class="footer-right">${button("Refresh task", "job-refresh", "refresh", "", `data-id="${esc(id)}"`)}<a class="button" href="/api/jobs/${encodeURIComponent(id)}/report" download>${icon("download")}Download report</a>${isActive(job) ? button("Stop task", "job-stop", "stop", "button-danger", `data-id="${esc(id)}"`) : canRetry(job) ? button("Retry task", "job-retry", "refresh", "button-primary", `data-id="${esc(id)}"`) : ""}</div>`,
       true,
     );
@@ -2186,8 +2353,10 @@
         ),
       );
     } catch (error) {
+      if (!root.isConnected) return;
       root.innerHTML =
-        info(esc(error.message), "error") +
+        info(esc(errorMessage(error)), "error") +
+        `<div class="heading-actions spaced-top">${list(error.actions).includes("save-results") ? button("Choose folder and save existing results", "recovery-job-export", "folder", "button-small", `data-id="${esc(id)}"`) : ""}<a class="button button-small" href="/api/jobs/${encodeURIComponent(id)}/report" download>Download report</a></div>` +
         (isFile
           ? `<div class="spaced-top">${fileDownload(path)}<p class="field-hint spaced-top">If a preview is unavailable, download the file to inspect it locally. Individual downloads are limited to 50 MB.</p></div>`
           : "");
@@ -2195,6 +2364,8 @@
   }
 
   async function showRepo(existingName = "") {
+    const returnWizard = A.returnWizard, returnLesson = A.returnLesson;
+    A.returnWizard = null; A.returnLesson = false;
     const revision = A.state.config_revision;
     const original = repos().find((r) => repoName(r) === existingName);
     const r = original || {
@@ -2305,7 +2476,7 @@
       e.preventDefault();
       busy($('button[form="repo-form"]'), async () => {
         try {
-          await api("/api/repos", {
+          const savedRepository = await api("/api/repos", {
             owner: $("#repo-owner").value.trim(),
             name: $("#repo-name").value.trim(),
             base_branch: $("#repo-branch").value,
@@ -2317,9 +2488,18 @@
             original_full_name: original ? repoName(original) : undefined,
             revision,
           });
-          if (currentDialog(version)) closeDialog();
+          const added = `${$("#repo-owner").value.trim()}/${$("#repo-name").value.trim()}`;
+          const relevant = currentDialog(version);
+          if (relevant) closeDialog();
           await refresh();
-          toast("Repository saved. Restart the worker to apply this change.");
+          if(returnWizard){A.returnWizard=null;newTask(added,{...returnWizard,repo:added});toast("Project saved. Your task request is still here. Apply the settings from its review step before queuing.");}
+          else if(returnLesson){A.returnLesson=false;location.hash="learn";renderView();toast("Project saved. Return to your lesson’s task button after applying settings in Settings.");}
+          else if(relevant && savedRepository.watch_setup_required) {
+            location.hash = "watches";
+            const watch = watches().find(row => row.repo === added && row.mode === "all");
+            if (watch) editWatch(watch);
+            toast("Repository saved. Choose a results folder and whether to enable its watch. Restart the idle worker in Settings to apply the new repository.");
+          } else toast("Repository saved. Restart the worker to apply this change.");
         } catch (error) {
           if (currentDialog(version)) dialogError(error);
           else reportError(error);
@@ -2348,7 +2528,7 @@
         .map((r) => `<option>${esc(repoName(r))}</option>`)
         .join(
           "",
-        )}</select></div><div class="field"><label for="watch-mode">What to watch</label><select id="watch-mode"><option value="selected">One selected pull request</option><option value="all">All current and future open pull requests</option></select></div><div class="field" id="watch-target-field"><label for="watch-target">Pull request</label><select id="watch-target" required><option value="">Choose a repository first…</option></select><span class="field-hint">Open pull requests accessible to your GitHub account.</span></div>${destinationFields(w, "watch")}${info("The first check records existing feedback as its starting point. New feedback after that can queue work automatically. Use New task to address comments that already exist.")}<div class="effects"><strong>Automatic follow-up uses your model</strong><ul><li>Future review comments may start coding tasks without another confirmation.</li><li>Tasks can push commits, post comments, and resolve supported review threads.</li><li>The same local worker call controls apply, separately from your provider’s subscription allowance.</li><li>Results are saved to the folder you choose above.</li></ul></div><label class="checkbox-label"><input id="watch-confirm" type="checkbox" required><span>I understand that this watch may start model requests and GitHub updates automatically.</span></label></div></form>`,
+        )}</select></div><div class="field"><label for="watch-mode">What to watch</label><select id="watch-mode"><option value="selected">One selected pull request</option><option value="all">All current and future open pull requests</option></select></div><div class="field" id="watch-target-field"><label for="watch-target">Pull request</label><select id="watch-target" required><option value="">Choose a repository first…</option></select><span class="field-hint">Open pull requests accessible to your GitHub account.</span></div>${watchDestinationFields(w, "watch")}${info("The first check records existing feedback as its starting point. New feedback after that can queue work automatically. Use New task to address comments that already exist.")}<div class="effects"><strong>Automatic follow-up uses your model</strong><ul><li>Future review comments may start coding tasks without another confirmation.</li><li>Tasks can push commits, post comments, and resolve supported review threads.</li><li>The same local worker call controls apply, separately from your provider’s subscription allowance.</li><li>Results are saved to the folder you choose above.</li></ul></div><label class="checkbox-label"><input id="watch-confirm" type="checkbox" required><span>I understand that this watch may start model requests and GitHub updates automatically.</span></label></div></form>`,
       `${button("Cancel", "dialog-close")}<button class="button button-primary" type="submit" form="watch-form">${icon("watch")}Create watch</button>`,
     );
     const version = A.dialogVersion;
@@ -2356,6 +2536,7 @@
     let requestId = 0;
     $("#watch-repo").addEventListener("change", async (e) => {
       w.repo = e.target.value;
+      reloadDestinations();
       w.accept_no_checks=false;
       w.number = "";
       w.target = null;
@@ -2401,7 +2582,7 @@
       w.number = e.target.value;
       w.target = targets.find((t) => String(t.number) === w.number);
     });
-    bindDestination(w, "watch");
+    const reloadDestinations = bindWatchDestination(w, "watch", () => w.repo);
     $("#watch-form").addEventListener("submit", (e) => {
       e.preventDefault();
       busy($('button[form="watch-form"]'), async () => {
@@ -2526,7 +2707,7 @@
           list(result.checks)
             .map(
               (c) =>
-                `<div class="diagnostic-row ${esc(c.status)}">${icon(c.status === "pass" ? "check-circle" : c.status === "warn" ? "alert" : "x")}<div><strong>${esc(c.name)}</strong><p>${esc(c.message)}</p>${c.action ? `<p>${esc(c.action)}</p>` : ""}</div></div>`,
+                `<div class="diagnostic-row ${esc(c.status)}">${icon(c.status === "pass" ? "check-circle" : c.status === "warn" ? "alert" : "x")}<div><strong>${esc(c.name)}</strong><p>${esc(c.message)}</p>${c.action ? `<p>${esc(c.action)}</p>` : ""}${c.next_step ? `<p>${esc(c.next_step)}</p>` : ""}${c.details ? `<details><summary>Read the recorded evidence</summary><pre>${esc(typeof c.details === "string" ? c.details : JSON.stringify(c.details,null,2))}</pre></details>` : ""}${recoveryLinks([c.action_id || "help"])}</div></div>`,
             )
             .join("") || info("No setup checks were returned by the worker.")
         }`;
@@ -2536,15 +2717,15 @@
       if (currentDialog(version)) dialogError(error);
     }
   }
-  function providerCheck() {
+  function providerCheck(provider = "") {
     confirmDialog(
-      "Test the model connection?",
+      provider ? `Test the ${provider === "glm" ? "GLM" : "DeepSeek"} connection?` : "Test the model connection?",
       "This sends exactly one small model request using the currently saved connection. Billing follows the selected provider or subscription. Save settings and restart the worker first if you changed the connection.",
       "Send one test request",
       async () => {
         const result = await api(
           "/api/provider-check",
-          { confirmed: true },
+          { confirmed: true, ...(provider ? {provider} : {}) },
           { timeout: 240000 },
         );
         if (!result.ok)
@@ -2558,13 +2739,14 @@
       },
     );
   }
-  function storeCredential() {
+  function storeCredential(prefill = "") {
     openDialog(
       "Store a credential",
       "WRITE-ONLY SECRET STORAGE",
-      `<form id="credential-form"><div class="wizard-stack"><p class="dialog-copy" style="margin:0">Credentials are saved in the worker’s private environment file with a descriptive record. Saved secrets are never returned to this browser.</p><div class="field"><label for="credential-kind">Credential type</label><select id="credential-kind"><option value="model">Dedicated provider API key</option><option value="broker">Company secret broker credential</option></select></div><div class="field"><label for="credential-value">New credential</label><input id="credential-value" type="password" autocomplete="new-password" required spellcheck="false"><span class="field-hint">Paste the application’s dedicated key. The saved value is never displayed.</span></div>${field("credential-supplier", "Supplied by", "", "The name recorded with this credential.", "text", "required")}${info("Storing a credential replaces that credential in the worker’s environment. Restart the worker after saving to use the new value. Keep an existing valid credential available until the new connection is verified.", "warning")}</div></form>`,
+      `<form id="credential-form"><div class="wizard-stack"><p class="dialog-copy" style="margin:0">Credentials are saved in the worker’s private environment file with a descriptive record. Saved secrets are never returned to this browser.</p><div class="field"><label for="credential-kind">Credential type</label><select id="credential-kind"><option value="model">Individual-task / GLM provider key</option><option value="deepseek">DeepSeek fleet provider key</option><option value="broker">Company secret broker credential</option><option value="deepseek-broker">Company broker for DeepSeek fleet</option></select></div><div class="field"><label for="credential-value">New credential</label><input id="credential-value" type="password" autocomplete="new-password" required spellcheck="false"><span class="field-hint">Paste the application’s dedicated key. The saved value is never displayed.</span></div>${field("credential-supplier", "Supplied by", "", "The name recorded with this credential.", "text", "required")}${info("Storing a credential replaces that credential in the worker’s environment. A DeepSeek choice also selects that connection for the DeepSeek fleet; other saved keys stay saved. Restart the worker after saving to use the new value. Keep an existing valid credential available until the new connection is verified.", "warning")}</div></form>`,
       `${button("Cancel", "dialog-close")}<button class="button button-primary" type="submit" form="credential-form">${icon("shield")}Store credential</button>`,
     );
+    if (prefill) $("#credential-kind").value = prefill;
     const version = A.dialogVersion;
     $("#credential-form").addEventListener("submit", (e) => {
       e.preventDefault();
@@ -2573,6 +2755,7 @@
           const secret = $("#credential-value");
           await api("/api/credentials", {
             kind: $("#credential-kind").value,
+            ...($("#credential-kind").value === "deepseek" ? {provider_source: "env"} : $("#credential-kind").value === "deepseek-broker" ? {provider_source: "broker-lease"} : {}),
             value: secret.value,
             supplied_by: $("#credential-supplier").value.trim(),
           });
@@ -2653,8 +2836,145 @@
     }, 4000);
   }
 
+  function readWizardDraft() {
+    try { return JSON.parse(window.localStorage.getItem("fatchin-task-request") || window.sessionStorage.getItem("fatchin-task-request") || "null"); }
+    catch { return null; }
+  }
+  function saveWizardDraft() {
+    const w = A.wizard;
+    if (!w || w.finished) return;
+    const saved = Object.fromEntries(["repo", "kind", "number", "account", "output_dir", "values", "learning_session_id"].filter(k => w[k] !== undefined).map(k => [k, w[k]]));
+    try { window.localStorage.setItem("fatchin-task-request", JSON.stringify(saved)); } catch { /* The open form remains usable if browser storage is full. */ }
+  }
+  function cooldownNotice() {
+    const waits=Object.entries(F.data?.rate_limits || {}).filter(([,row]) => new Date(row.until).getTime()>Date.now());
+    return waits.map(([provider,row]) => info(`<strong>${esc(provider)} is waiting.</strong> ${esc(row.reason || "The service asked the fleet to wait.")} Next attempt after ${esc(date(row.until))}. No action is needed while this cooldown is active.`)).join("");
+  }
+  function fleetRecoveryControls(item, includeDetails = true) {
+    const r = item.recovery || {}, actions = list(r.actions), attrs = `data-id="${esc(item.id)}" data-fleet-id="${esc(item.fleet_id)}"`;
+    let html = includeDetails ? button("Read result and next steps", "fleet-open-item", "file", "button-small", attrs) : "";
+    if (item.archived_at) return html + button("Restore to working list", "recovery-fleet-restore", "refresh", "button-small", attrs);
+    if (actions.includes("review_scope")) html += button("Review selected projects", "recovery-fleet-scope", "repo", "button-small", attrs);
+    if (actions.includes("check_access")) html += button("Check this project’s GitHub access", "recovery-fleet-access", "shield", "button-small", `data-repo="${esc(item.repo)}"`);
+    if (r.needs_checks) html += button("Prepare a request to explain this failed check", "recovery-explain-check", "help", "button-small", attrs) + button("Set verification command", "fleet-configure-checks", "check-circle", "button-small", `${attrs} data-repo="${esc(item.source_repo || item.repo)}"`);
+    if (r.can_retry) html += button("Retry after fixing the cause", "recovery-fleet-retry", "refresh", "button-small", attrs);
+    if (actions.includes("resume")) html += button("Review resuming this fleet", "recovery-fleet-resume", "play", "button-small", attrs);
+    if (actions.includes("authorize_budget")) html += button("Choose an additional call budget", "recovery-budget", "spark", "button-small", attrs);
+    if (actions.includes("diagnostics") || actions.includes("connections")) html += button("Check connections", "diagnostics", "shield", "button-small");
+    if (["blocked", "failed", "done", "dismissed"].includes(item.status)) html += button("Archive item", "recovery-fleet-archive", "", "button-small", attrs);
+    return html;
+  }
+  async function showFleetDetail(id) {
+    if (!id) { location.hash = "fleet"; return; }
+    openDialog("Reading saved work", "YOUR SAVED RESULT", loading("Reading the result and its recovery choices."), button("Close", "dialog-close"));
+    const version=A.dialogVersion;
+    let data;
+    try {if (!F.data) await loadFleet();data=await api(`/api/fleet/item?${query({id})}`);}catch(error){if(currentDialog(version))dialogError(error);return;}
+    if(!currentDialog(version))return;
+    const item = data.item, r = item.recovery || {}, result = item.result || {};
+    const ready = item.readiness || result.readiness;
+    const timeline = list(item.history);
+    openDialog(item.title || "Saved fleet work", "RESULT, EVIDENCE & NEXT STEP",
+      `<p>${esc(item.repo)}${item.number ? ` · #${esc(item.number)}` : ""} · ${fleetStatus(item.status)} · Fleet ${esc(item.fleet_status || data.fleet?.status || "status unknown")}</p>
+      ${item.archived_at ? info(`Archived ${esc(date(item.archived_at))}. ${esc(item.archive_reason || "Its saved evidence is kept.")}`) : ""}
+      <section class="recovery-card"><h3>${esc(r.title || "Your saved result")}</h3><p>${esc(r.explanation || item.error || result.summary || "No result summary was recorded for this older item.")}</p><p><strong>What you can do next:</strong> ${esc(r.next_step || "Read the saved evidence, open the project on GitHub, or archive this completed item.")}</p>${r.retry_at ? `<p>Next automatic attempt: ${esc(date(r.retry_at))}. Waiting for ${esc(r.waiting_for || "the service")}.</p>` : ""}<div class="recovery-actions">${fleetRecoveryControls(item, false)}</div></section>
+      <div class="heading-actions">${fleetLink(item.url, "Open the original work on GitHub")}${fleetProvenance(item)}</div>
+      ${fleetChecks(result.checks || item.checks)}${ready ? `<section class="detail-section"><h3>What still needs to happen before merging</h3><p>${esc(ready.reason || ready.message || (ready.ready ? "The recorded checks allowed a merge decision. Recheck GitHub before merging." : "I don't know whether all merge requirements are met. Open GitHub to check its current tests, approvals and open feedback."))}</p><details><summary>Read the recorded merge evidence</summary><pre>${esc(JSON.stringify(ready, null, 2))}</pre></details></section>` : ""}
+      ${result.dry_run_actions ? `<section class="detail-section"><h3>What this dry run would send</h3><pre>${esc(JSON.stringify(result.dry_run_actions, null, 2))}</pre></section>` : ""}
+      <section class="detail-section"><h3>Saved report files</h3>${button("Read the saved report file", "recovery-fleet-files", "folder", "button-small", `data-id="${esc(id)}"`)}<div id="fleet-file-result"></div></section>
+      <details class="detail-section"><summary>Read the complete saved result</summary><pre>${esc(JSON.stringify(result, null, 2))}</pre></details>
+      <details class="detail-section"><summary>Attempts and recovery history (${number(timeline.length)})</summary><pre>${esc(JSON.stringify(timeline, null, 2))}</pre></details>
+      <details class="detail-section"><summary>Publication evidence</summary><pre>${esc(JSON.stringify(item.operations || item.mutation_intents || [], null, 2))}</pre></details>`,
+      `${button("Close", "dialog-close")}<a class="button" href="/api/fleet/report?${query({id})}" download>${icon("download")}Download report</a>`, true);
+  }
+  function taskRecoveryPanel(job) {
+    const notes = job.notes || {}, id = job.job_id, attrs = `data-id="${esc(id)}"`;
+    let html = "";
+    if ((notes.posting || notes.publish_outcome === "uncertain") && !notes.post_recovery && job.state !== "waiting-on-you") html += `<section class="recovery-card"><h3>I don't know whether the earlier publication completed</h3><p>Read the saved evidence and inspect GitHub. Nothing will be sent again by Retry while the earlier outcome is uncertain.</p>${button("Check what reached GitHub", "recovery-post-check", "refresh", "", attrs)}${button("Record what I found and retire this decision", "recovery-post-retire", "", "", attrs)}</section>`;
+    if (job.state === "waiting-on-you") {
+      html += `<section class="recovery-card"><h3>This task is waiting for your decision</h3><p>Nothing else will be posted from this decision until you choose. Read the draft below, then review it for posting, edit it, or discard the remaining proposal.</p>${list(notes.drafts).map(d => `<details><summary>${esc(d.title || d.name)}</summary><pre>${esc(d.body || "No draft text was recorded.")}</pre></details>`).join("")}`;
+      if (notes.posting || notes.phase === "posting-unconfirmed") html += `<p>I don't know whether the previous post reached GitHub. Keep its evidence and check the remote result before deciding.</p>${button("Check what reached GitHub", "recovery-post-check", "refresh", "", attrs)}${button("Record what I found and retire this decision", "recovery-post-retire", "", "", attrs)}`;
+      else html += button("Review draft before posting", "draft-review", "file", "", attrs) + button("Edit draft", "draft-edit", "edit", "", attrs) + button("Discard remaining drafts", "draft-discard", "", "", attrs);
+      html += "</section>";
+    }
+    if (notes.result_export_error) html += `<section class="recovery-card"><h3>Save the results you already have</h3><p>Choose another folder and save this attempt’s existing results again. This does not rerun the model or post to GitHub.</p>${button("Choose folder and save results again", "recovery-job-export", "folder", "", attrs)}</section>`;
+    if (canRetry(job)) html += `<section class="recovery-card"><h3>Choose how to continue</h3><p>${esc(job.error || "This attempt did not finish.")} Your earlier work and any changes already posted are kept. You can correct the request for a new attempt, check the connections, or archive this attempt.</p>${button("Edit request for another attempt", "recovery-job-edit", "edit", "", attrs)}${button("Open setup checks", "diagnostics", "shield", "")}</section>`;
+    if(notes.post_recovery)html+=`<section class="recovery-card"><h3>This earlier publishing decision was retired</h3><p>The outcome (${esc(notes.post_recovery.outcome)}) was reported by a person. Fatchin has not independently proved it. Its original publishing record is kept and will not be replayed by Retry.</p>${list(notes.post_checks).flatMap(check=>list(check.evidence).map(e=>fleetLink(e.url,e.title||"Read GitHub evidence"))).join("")}</section>`;
+    if (["done", "failed", "stopped"].includes(job.state)) html += `<div class="recovery-actions">${button(notes.archived_at ? "Restore from history" : "Archive this task", notes.archived_at ? "recovery-job-restore" : "recovery-job-archive", "", "button-small", attrs)}${!notes.result_export_error ? button("Save these results to another folder", "recovery-job-export", "folder", "button-small", attrs) : ""}</div>`;
+    return html;
+  }
+  async function exportDestination(kind, record) {
+    const obj = {account: kind === "lesson" ? record.account : record.notes?.member || record.notes?.account || "", output_dir: kind === "lesson" ? record.output_dir : record.notes?.output_dir || ""};
+    openDialog(kind === "lesson" ? "Choose where to save this lesson" : "Save this attempt’s results again", "KEEP THE WORK YOU ALREADY HAVE", `<p class="dialog-copy">Choose a folder in the original member’s account. Earlier files stay where they are. This action makes no model request and changes nothing on GitHub.</p><form id="recovery-destination-form">${destinationFields(obj, "recover")}</form>`, `${button("Cancel", "dialog-close")}<button class="button button-primary" type="submit" form="recovery-destination-form">${kind === "lesson" ? "Use this transcript destination" : "Save existing results"}</button>`);
+    bindDestination(obj, "recover");
+    if (obj.account) $("#recover-account").disabled = true;
+    $("#recovery-destination-form").addEventListener("submit", event => {
+      event.preventDefault(); busy($('[form="recovery-destination-form"]'), async () => {
+        try {
+          validateDestination(obj);
+          if (kind === "lesson") {const reply = await api("/api/learn", {action:"destination",id:record.id,revision:record.revision,...obj}); L.session=reply.session;closeDialog();renderView();toast("Transcript destination changed. Choose Export transcript to save it, or Download transcript to keep a browser copy.");}
+          else {const reply=await api(`/api/jobs/${encodeURIComponent(record.job_id)}/recovery`,{action:"export",...obj});await refresh(false);toast(reply.message || reply.hint || "Existing results saved.");showJob(reply.job);}
+        } catch(error){dialogError(error);}
+      });
+    });
+  }
+  function savedLessonsPanel() {
+    return `<section class="panel spaced-top"><div class="panel-header"><div><h2>Return to a saved lesson</h2><p>Your lessons stay on this server even if you use another browser. Choose your member account to find them.</p></div></div><div class="panel-body"><div class="field"><label for="saved-lessons-account">Your member account</label><select id="saved-lessons-account"><option value="">Choose your account…</option>${list(A.state.accounts).map(a => `<option value="${esc(a.account)}"${a.account === (L.savedAccount || L.session?.account || L.setup.account) ? " selected" : ""}>${esc(a.label || a.account)}</option>`).join("")}</select></div>${button("Find saved lessons", "recovery-lessons", "folder")}${L.savedError ? info(esc(L.savedError),"error") : ""}<div class="saved-lessons">${list(L.savedList).map(row => `<article class="recovery-card"><h3>${esc(row.repo || row.lesson || "Saved lesson")}</h3><p>${esc(row.status || "Could not be read")} · ${esc(date(row.updated_at || row.created_at))}</p>${row.error ? info(esc(row.error),"error") : ""}${row.next_step ? `<p>${esc(row.next_step)}</p>` : ""}${row.readable === false ? recoveryLinks(["diagnostics"]) : button("Open saved lesson", "recovery-lesson-open", "arrow", "button-small", `data-id="${esc(row.id)}"`)}</article>`).join("")}${L.savedList && !L.savedList.length ? '<p>No lessons were found for this account. You can start a new lesson above.</p>' : ""}</div></div></section>`;
+  }
+  function watchRecoveryButtons(w) {
+    let html=button(w.setup_required ? "Finish watch setup" : w.health === "needs-folder" ? "Choose results folder" : "Edit watch", "recovery-watch-edit", "edit", "button-small", `data-key="${esc(`${w.repo}|${w.mode}|${w.number||""}`)}"`);
+    if(w.health==="worker-stopped")html+=button("Start worker","service-start","play","button-small");
+    if(w.health==="paused")html+=button("Resume feedback checks","service-resume","play","button-small");
+    if(w.health==="author-not-allowed")html+=button("Review allowed feedback senders","recovery-command-settings","settings","button-small");
+    if(w.health==="lookup-failed")html+=button("Check this connection","diagnostics","shield","button-small");
+    if(["queued","task-in-progress"].includes(w.health))html+=button("Open tasks","recovery-jobs","arrow","button-small");
+    if(["closed","repository-removed"].includes(w.health))html+=fleetLink(targetURL(w.repo,"fix-pr",w.number),"Open GitHub");
+    if(w.health==="repository-removed")html+=button("Add this repository again","new-repo","repo","button-small",`data-repo="${esc(w.repo)}"`);
+    return html;
+  }
+  function editWatch(w) {
+    const obj={account:w.member || w.account || "",output_dir:w.output_dir || ""};
+    openDialog(w.setup_required ? "Finish setting up this review watch" : "Repair or change this review watch", "KEEP ITS FEEDBACK HISTORY", `<p>${esc(w.repo)} · ${esc(w.status_reason || "Choose where its results belong and what it should follow.")}</p><form id="watch-edit-form"><div class="wizard-stack"><label class="checkbox-label"><input id="watch-edit-enabled" type="checkbox"${w.enabled !== false && !w.closed ? " checked" : ""}><span><strong>Check for new feedback automatically</strong><small>When enabled, new eligible feedback may start model requests and GitHub changes. Leave this off to keep the watch stopped while saving its setup.</small></span></label>${watchDestinationFields(obj,"watch-edit")}<div class="field"><label for="watch-edit-mode">What to follow</label><select id="watch-edit-mode"><option value="all"${w.mode === "all" ? " selected" : ""}>All open and future pull requests</option><option value="selected"${w.mode !== "all" ? " selected" : ""}>One pull request</option></select></div>${field("watch-edit-number","Pull request number (for one pull request)",w.number || "","A pull request is a proposed change on GitHub.","number",'min="1"')}<label class="checkbox-label"><input id="watch-edit-scope-confirm" type="checkbox"><span>If I change what is followed, keep the earlier feedback record. The new selection starts from its existing feedback; I can create a task for earlier comments.</span></label><p>The destination changes on the existing watch. It does not discard feedback history or rerun earlier tasks.</p></div></form>`, `${button("Cancel","dialog-close")}<button class="button button-primary" type="submit" form="watch-edit-form">Save watch changes</button>`);
+    bindWatchDestination(obj,"watch-edit", () => w.repo);
+    $("#watch-edit-form").addEventListener("submit", event=>{event.preventDefault();busy($('[form="watch-edit-form"]'),async()=>{try{validateDestination(obj);await api("/api/watches/edit",{repo:w.repo,mode:w.mode || "selected",number:w.number,new_mode:$("#watch-edit-mode").value,new_number:Number($("#watch-edit-number").value)||undefined,confirmed_scope_change:$("#watch-edit-scope-confirm").checked,enabled:$("#watch-edit-enabled").checked,...obj});closeDialog();await refresh();toast("Watch setup saved. Earlier feedback and results are kept. Its status shows whether automatic checks are enabled or stopped.");}catch(error){dialogError(error);}});});
+  }
+  async function recoveryAction(element) {
+    const {action,id}=element.dataset;
+    if (["recovery-help","recovery-fleet","recovery-jobs","recovery-watches"].includes(action)) {closeDialog();location.hash=action.slice(9)==="help"?"help":action.slice(9);return;}
+    if (action === "recovery-command-settings") {closeDialog();location.hash="settings";setTimeout(()=>$("#command-settings")?.scrollIntoView(),50);return;}
+    if (action === "recovery-done-more") {A.doneLimit=(A.doneLimit||30)+30;renderView();return;}
+    if (action === "recovery-decisions-more") {A.decisionLimit=(A.decisionLimit||30)+30;renderView();return;}
+    if (action === "recovery-fresh-task") return confirmDialog("Clear this unfinished request and start again?","This clears only the request details saved in this browser. Existing tasks, their history, result files and GitHub changes stay exactly as they are.","Clear entered details and start again",async()=>{if(A.wizard)A.wizard.finished=true;window.localStorage.removeItem("fatchin-task-request");window.sessionStorage.removeItem("fatchin-task-request");newTask();});
+    if (action === "recovery-folder-home") return loadFolders("");
+    if (action === "recovery-provider-glm" || action === "recovery-provider-deepseek") return providerCheck(action.split("-").at(-1));
+    if (action === "recovery-filter-clear") {F.search="";F.repoFilter="all";F.visibleLimit=50;renderView();return;}
+    if (action === "recovery-fleet-files") {const root=$("#fleet-file-result");root.innerHTML=loading("Reading the saved report");try{const reply=await api(`/api/fleet/files?${query({id})}`);root.innerHTML=reply.content!==undefined?`<pre>${esc(reply.content)}</pre>${reply.truncated?'<p>This preview is shortened. Download the complete item record with Download report.</p>':""}`:info(esc(reply.message||"Download report keeps this item’s complete recorded evidence."));}catch(error){root.innerHTML=info(esc(errorMessage(error)),"error");}return;}
+    if (action === "recovery-fleet-access") {openDialog("Checking this project’s GitHub access", "READ-ONLY CHECK", loading("Checking GitHub access"), button("Close","dialog-close"));const version=A.dialogVersion;const reply=await api(`/api/repository-access?${query({repo:element.dataset.repo})}`);if(!currentDialog(version)) return;openDialog("This project’s GitHub access","CHECKED WITHOUT CHANGING THE PROJECT",`<p>Checked ${esc(date(reply.checked_at))}</p><p>${esc(reply.message)}</p><p><strong>Next step:</strong> ${esc(reply.next_step)}</p>${fleetLink(reply.github_url,"Open this project on GitHub")}`,`${button("Close","dialog-close")}${button("Open connection settings","go-settings","settings")}`);return;}
+    if (action === "recovery-review-resume") return reviewFleetResume(element.dataset.fleetId);
+    if (action === "recovery-explain-check") {const item=(await api(`/api/fleet/item?${query({id})}`)).item;const f=list(F.data?.fleets).find(f=>f.id===item.fleet_id);const checks=list(item.result?.checks||item.checks);const question=("Explain why this project check failed and show the smallest steps I can take next. Do not change code or post to GitHub. Recorded evidence: "+JSON.stringify(checks)).slice(0,2000);newTask(item.source_repo||item.repo,{repo:item.source_repo||item.repo,kind:"explain-repo",account:f?.account||"",output_dir:f?.output_dir||"",values:{question}});return;}
+    if (action === "recovery-fleet-scope") {const item=list(F.data?.items).find(i=>i.id===id)||(await api(`/api/fleet/item?${query({id})}`)).item;const f=list(F.data?.fleets).find(f=>f.id===item.fleet_id);if(f){F.setup.account=f.account;F.setup.output_dir=f.output_dir;F.setup.scope=f.scope;F.setup.repos=[...list(f.repos)];}F.repoQuery=item.repo;F.setupExpanded=true;closeDialog();location.hash="fleet";renderView();const target=$("#fleet-repo-query")||$("#fleet-scope");target?.scrollIntoView({block:"center"});target?.focus({preventScroll:true});toast("Review your selected projects. To change them, stop the fleet, make your selection, then dispatch it. Nothing has been included or resumed for you.");return;}
+    if (["recovery-fleet-archive","recovery-fleet-restore","recovery-fleet-retry","recovery-fleet-resume"].includes(action)) {
+      const operation=action.split("-").at(-1);const item=list(F.data?.items).find(i=>i.id===id)||(await api(`/api/fleet/item?${query({id})}`)).item;
+      return confirmDialog(operation==="archive"?"Move this item to history?":operation==="restore"?"Restore this item?":operation==="resume"?"Resume this fleet?":"Retry this item?",operation==="archive"?"This hides the item from the working list. Its errors, results, and published-change records remain in History. It does not change GitHub.":operation==="restore"?"This returns the saved item to the working list. It stays held until you explicitly retry it.":operation==="resume"?"This allows the saved fleet to work in its existing selection and mode. It may make model requests and publish the changes already authorized for that fleet. Return to this item to retry after checking its cause.":"This permits another bounded attempt. It may use more model calls or publish changes to GitHub. Previous attempts remain in its history.",operation==="archive"?"Archive and keep its evidence":operation==="restore"?"Restore saved item":operation==="resume"?"Resume saved fleet":"Queue another attempt",async()=>{await mutateFleet(operation,{fleet_id:item.fleet_id,...(operation!=="resume"?{item_id:item.id}:{}),reason:"Archived by the person reviewing this item."});if(!F.error){closeDialog();if(A.view==="fleet")renderView();}else throw new Error(F.error);});
+    }
+    if (action === "recovery-budget") {const id=element.dataset.fleetId||currentFleet()?.id;if(!id)throw new Error("Open the saved fleet first to choose its budget.");const fleet=await freshFleetDecision(id);if(fleet)showFleetBudget(fleet);return;}
+    if (action === "recovery-wizard-start" || action === "recovery-wizard-restart") {const w=A.wizard;saveWizardDraft();try{await api("/api/service",{action:action.endsWith("restart")?"restart":"start"});await refresh(false);A.wizard=w;renderWizard();toast("Worker is ready. Your task request is still here for review.");}catch(error){dialogError(error);}return;}
+    if (action === "recovery-job-edit") {const job=jobs().find(j=>j.job_id===id),request=job?.notes?.request||{};if(!job)throw new Error("Refresh Tasks to choose this saved task.");newTask(job.repo_full_name,{repo:request.repo||job.repo_full_name,kind:request.kind||job.kind,number:String(request.number||job.number||""),account:request.account||job.notes?.member||"",output_dir:request.output_dir||job.notes?.output_dir||"",values:{...request,...(request.values||{}),...(job.notes?.values||{})}});return;}
+    if (action === "recovery-job-export") {const job=jobs().find(j=>j.job_id===id)||(await api(`/api/jobs/${encodeURIComponent(id)}`)).job;return exportDestination("job",job);}
+    if (action === "recovery-job-archive" || action === "recovery-job-restore") {const op=action.endsWith("restore")?"restore":"archive";return confirmDialog(op==="archive"?"Archive this attempt?":"Restore this saved attempt?", "The original attempt, errors, result files, and GitHub changes are kept. This does not execute or publish anything.",op==="archive"?"Archive and keep history":"Restore to working list",async()=>{const reply=await api(`/api/jobs/${encodeURIComponent(id)}/recovery`,{action:op});toast(reply.message);await refresh(false);closeDialog();renderView();});}
+    if (action === "recovery-post-check") {const reply=await api(`/api/jobs/${encodeURIComponent(id)}/recovery`,{action:"recheck-post"});await refresh(false);showJob(reply.job);$("#dialog-body").insertAdjacentHTML("beforeend",`<section class="recovery-card"><h3>What GitHub returned</h3><p>${esc(reply.message||reply.hint)}</p>${list(reply.evidence).map(e=>fleetLink(e.url,e.title||"Inspect matching evidence")).join("")}</section>`);toast(reply.message||reply.hint||"The remote evidence is recorded in this task.");return;}
+    if (action === "recovery-post-retire") {openDialog("Record what you found on GitHub","A PERSON CHECKS THE OUTCOME", `<p>I don't know whether the earlier write completed. Open the intended repository and inspect the draft’s target first. Retiring this decision will not send it again, remove published work, or claim that the code passed.</p><form id="post-retire-form"><div class="field"><label for="post-outcome">What did you find?</label><select id="post-outcome"><option value="unknown">I still do not know</option><option value="posted">The intended change is there</option><option value="not-posted">The intended change is not there</option></select></div><label class="checkbox-label"><input id="post-retire-confirm" type="checkbox" required><span>I checked GitHub and want to retire this decision. Record this as my report, with the original evidence kept.</span></label></form>`,`${button("Keep decision open","dialog-close")}<button class="button button-primary" type="submit" form="post-retire-form">Record my report and retire decision</button>`);$("#post-retire-form").addEventListener("submit",e=>{e.preventDefault();busy($('[form="post-retire-form"]'),async()=>{try{const reply=await api(`/api/jobs/${encodeURIComponent(id)}/recovery`,{action:"retire-post",outcome:$("#post-outcome").value,confirmed:$("#post-retire-confirm").checked});await refresh(false);showJob(reply.job);toast(reply.message||reply.hint);}catch(error){dialogError(error);}});});return;}
+    if (action === "recovery-watch-edit") {const w=watches().find(w=>`${w.repo}|${w.mode}|${w.number||""}`===element.dataset.key);if(w)return editWatch(w);throw new Error("Refresh Review watches to choose this watch.");}
+    if (action === "recovery-lessons") {const account=$("#saved-lessons-account").value;if(!account)throw new Error("Choose your member account so the app can find your lessons.");L.savedAccount=account;try{L.savedList=(await api(`/api/learn/sessions?${query({account})}`)).items;L.savedError="";}catch(error){L.savedError=errorMessage(error);}renderView();return;}
+    if (action === "recovery-lesson-open") {if(unsavedPractice())throw new Error("Save your practice edit before opening a different lesson, or export the current lesson first.");lessonMemory("set",id);return restoreLesson(id);}
+    if (action === "recovery-lesson-destination") return exportDestination("lesson",L.session);
+    if (action === "recovery-lesson-addrepo") {A.returnLesson=true;await showRepo();const parts=(L.session?.repo||"").split("/");if(parts.length===2){$("#repo-owner").value=parts[0];$("#repo-name").value=parts[1];}return;}
+    if (action === "recovery-rules") {const repo=element.dataset.repo;openDialog("Inspect this project’s rules","WHAT GITHUB CAN CONFIRM",loading("Reading rules from GitHub. No change will be made."),button("Close","dialog-close"));const version=A.dialogVersion;try{const r=await api(`/api/rules?${query({repo})}`);if(!currentDialog(version))return;$("#dialog-body").innerHTML=`<p><strong>${esc(r.state)}</strong> · Checked ${esc(date(r.checked_at))}</p><p>${esc(r.reason)}</p><p>You can check repository access in Settings or read the rules on GitHub. An unreadable rule is not permission to bypass it.</p><a class="button" href="https://github.com/${esc(repo)}/settings/rules" target="_blank" rel="noopener noreferrer">Open GitHub rules</a>${button("Check connections","diagnostics","shield")}<details><summary>Read the returned evidence</summary><pre>${esc(JSON.stringify(r.rules||r,null,2))}</pre></details>`;await loadFence(true);}catch(error){if(currentDialog(version))dialogError(error);}return;}
+  }
+
   async function handleAction(element) {
     const action = element.dataset.action;
+    if (action.startsWith("recovery-")) return recoveryAction(element);
     if (action.startsWith("fleet-")) return fleetAction(element);
     if (action.startsWith("learn-") || action.startsWith("explore-")) return learnAction(element);
     if (action === "refresh") return refresh();
@@ -2675,10 +2995,11 @@
       A.wizard.step = index > 0 ? flow[index - 1] : 0;
       return renderWizard();
     }
-    if (action === "new-repo") return showRepo();
+    if (action === "new-repo") {const parent=A.dialog==="Create a task"?A.wizard:null;A.returnWizard=parent?{...parent}:null;if(parent)saveWizardDraft();const repo=element.dataset.repo||parent?.repo||"";await showRepo();const parts=repo.split("/");if(parts.length===2){$("#repo-owner").value=parts[0];$("#repo-name").value=parts[1];}return;}
     if (action === "edit-repo") return showRepo(element.dataset.repo);
     if (action === "new-watch") return showWatch();
     if (action === "go-settings") {
+      if(dialog.open)closeDialog();
       location.hash = "settings";
       return;
     }
@@ -2705,7 +3026,7 @@
         },
       );
     }
-    if (["draft-post", "draft-edit", "draft-discard"].includes(action)) {
+    if (["draft-post", "draft-review", "draft-edit", "draft-discard"].includes(action)) {
       if (element.disabled) return;
       return draftAction(element.dataset.id, action.slice("draft-".length));
     }
@@ -2736,6 +3057,7 @@
     if (action === "diagnostics") return diagnostics();
     if (action === "provider-check") return providerCheck();
     if (action === "store-credential") return storeCredential();
+    if (action === "store-deepseek") return storeCredential("deepseek");
     if (action === "github-connect") return githubConnect();
     if (action === "job-detail") {
       const j = jobs().find((j) => j.job_id === element.dataset.id);
@@ -2813,16 +3135,16 @@
       const w = watches()[Number(element.dataset.index)];
       if (!w) return;
       return confirmDialog(
-        "Remove this review watch?",
-        `Future automatic follow-up will stop for ${w.repo || w.repo_full_name}${w.mode === "all" ? "" : ` #${w.number}`}. Already queued tasks and their results remain.`,
-        "Remove watch",
+        "Stop this review watch and keep its history?",
+        `Future automatic follow-up will stop for ${w.repo || w.repo_full_name}${w.mode === "all" ? "" : ` #${w.number}`}. Already queued tasks, results, and feedback positions remain. Edit watch lets you enable it again.`,
+        "Stop watch",
         async () => {
           await api("/api/watches/remove", {
             repo: w.repo || w.repo_full_name,
             mode: w.mode || "selected",
             number: w.number,
           });
-          toast("Review watch removed.");
+          toast("Review watch stopped. Its history remains available.");
         },
         { danger: true },
       );
@@ -2845,8 +3167,8 @@
       return confirmDialog(
         command === "stop" ? "Stop the worker?" : "Restart the worker?",
         command === "stop"
-          ? "This stops the background service only when it is idle. Stop queued or running tasks first, then wait for the current step to finish. Saved records are kept. Start it again when ready."
-          : "This restarts the background service to load saved settings only when it is idle. Stop queued or running tasks first, then wait for the current step to finish. Saved records are kept.",
+          ? "This stops the background service only when it is idle. Stop queued or running tasks first, then wait for the current step to finish. Saved drafts stay available across a restart. Saved records are kept. Start it again when ready."
+          : "This restarts the background service to load saved settings only when it is idle. Stop queued or running tasks first, then wait for the current step to finish. Saved drafts stay available across a restart. Saved records are kept.",
         command === "stop" ? "Stop worker" : "Restart worker",
         async () => {
           await api("/api/service", { action: command });
@@ -2861,7 +3183,10 @@
     }
   }
 
+  document.addEventListener("input", () => { if (A.wizard) queueMicrotask(saveWizardDraft); });
+  document.addEventListener("change", () => { if (A.wizard) queueMicrotask(saveWizardDraft); });
   document.addEventListener("click", (e) => {
+    if(e.target.closest("[data-lesson-download]") && unsavedPractice()){e.preventDefault();reportError(new Error("Save your practice edit before downloading. The transcript contains the saved file; your typed text is still in the editor."));return;}
     const nav = e.target.closest('a[href^="#"]');
     if (
       nav &&
@@ -2915,7 +3240,7 @@
       ? handleAction({ dataset: { action: "settings-reload" } })
       : refresh(),
   );
-  const phoneLayout = matchMedia("(max-width:720px)");
+  const phoneLayout = matchMedia("(max-width:1000px)");
   const closeMobileNav = () => {
     const wasOpen = $("#sidebar").classList.contains("open");
     $("#sidebar").classList.remove("open");

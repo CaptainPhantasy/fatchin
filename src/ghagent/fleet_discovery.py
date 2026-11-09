@@ -19,6 +19,14 @@ class DiscoveryError(ValueError):
     pass
 
 
+HALT_LABEL = 'fatchin-halted'
+
+
+def _halted(pr):
+    """True when a person labelled the pull request to stop fleet work on it."""
+    return any(isinstance(label, dict) and label.get('name') == HALT_LABEL for label in pr.get('labels') or [])
+
+
 def _policy_allows(full_name, policy, account):
     """Personal repos default on; organisation repos default off.
 
@@ -327,7 +335,8 @@ class FleetDiscovery:
                 try:
                     prs = self._get(f'/repos/{repo}/pulls?state=open&sort=created&direction=desc&per_page=100', paginate=True)
                     listed[repo] = prs
-                    work.extend((repository, pr) for pr in prs)
+                    # A person halted this PR: discover no new review/fix work for it.
+                    work.extend((repository, pr) for pr in prs if not _halted(pr))
                 except Exception:
                     failed.add(repo)
             work.sort(key=lambda pair: pair[1].get('created_at', ''), reverse=True)

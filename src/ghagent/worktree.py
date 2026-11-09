@@ -93,17 +93,31 @@ def fetch_pr_worktree(
     return os.path.abspath(dest_path)
 
 
+def _gate_git(worktree_path: str, args: list[str]) -> tuple[int, str, str]:
+    """Non-raising git call for the pre-commit gate, which decides the failure."""
+    try:
+        proc = _run_git(worktree_path, args)
+    except GitError as exc:
+        return 1, "", str(exc)
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
 def commit_all(
     worktree_path: str,
     message: str,
     author_name: str,
     author_email: str,
+    allow: tuple = (),
 ) -> str:
     """Stage everything and commit with the given author. Returns the new sha.
 
     When there is nothing to commit, returns the current HEAD sha instead.
     """
     _run_git(worktree_path, ["add", "-A"])
+    # Nothing reaches the remote without passing the secret gate first.
+    from .secret_gate import check_commit
+    check_commit(lambda argv: _gate_git(worktree_path, argv),
+                 worktree_path, allow=allow)
     args = [
         "-c",
         f"user.name={author_name}",

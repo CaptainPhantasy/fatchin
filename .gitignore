@@ -15,3 +15,53 @@ build/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Dependencies, editors and operating-system files
+node_modules/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Local credentials and credential exports
+.env*
+*.env*
+!.env.example
+!.env.sample
+!*.env.example
+!*.env.sample
+credentials.json
+credentials*.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Member output, runtime state and private verification receipts
+audit/
+records/
+.state/
+coverage/
+.coverage
+htmlcov/
+*.sqlite
+*.sqlite3
+*.db
+*.sql
+*.bak
+*.bak-*
+*.bak.*
+*.tmp
+
+# Local credential stores
+.git-credentials
+.netrc
+.npmrc
+.pypirc
+id_rsa
+id_ed25519
+secrets.json
+secrets.yaml
+secrets.yml

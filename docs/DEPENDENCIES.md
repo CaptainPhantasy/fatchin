@@ -65,3 +65,11 @@ entry points. It does not fetch a runtime dependency because there is none.
 Add `pip-audit` (or an equivalent) to CI, generate an SBOM for the release,
 and record each new package with its purpose, licence, and version. Do not add
 a dependency merely for convenience; the standard library is the default.
+
+## Release packaging checks
+
+The package CI job uses `build==1.6.1` and `wheel==0.48.0` with the pinned
+`setuptools==84.2.1` backend. These are build tools only, not runtime
+requirements. It builds both source and wheel artifacts, installs the wheel,
+and checks the command entry points, version, web assets and guide files outside
+the source checkout. Release verification outputs stay outside version control.

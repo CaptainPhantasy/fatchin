@@ -1,0 +1,7 @@
+include VERSION
+recursive-include web *.html *.js *.css *.svg *.png *.ico *.webmanifest *.ttf *LICENSE*
+recursive-include docs *.md
+prune audit
+prune backups
+prune records
+prune .state

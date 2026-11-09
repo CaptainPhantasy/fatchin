@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import hashlib
 import json
 import mimetypes
 import os
@@ -14,14 +15,18 @@ import re
 import socket
 import ssl
 import sys
+import sysconfig
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 
+from .learning import LearningError
 from .github_client import GitHubError, redact_text
 from .web_control import ApiError, VERSION, WebControl, target_number
 
-WEB_ROOT = Path(__file__).resolve().parents[2] / 'web'
+_SOURCE_WEB = Path(__file__).resolve().parents[2] / 'web'
+WEB_ROOT = (_SOURCE_WEB if _SOURCE_WEB.is_dir() else
+            Path(sysconfig.get_path('data')) / 'share' / 'fatchin' / 'web')
 
 
 class GuiServer(ThreadingHTTPServer):
@@ -41,7 +46,11 @@ class GuiServer(ThreadingHTTPServer):
     def _reload_tls(self, *, initial=False):
         try:
             stats = [p.stat() for p in self._tls_paths]
-            signature = tuple((s.st_mtime_ns, s.st_ino, s.st_size) for s in stats)
+            # In-place renewal can keep the same size and filesystem timestamp.
+            # Fingerprints stay in memory and are never returned or logged.
+            signature = tuple((s.st_mtime_ns, s.st_ino, s.st_size,
+                               hashlib.sha256(path.read_bytes()).digest())
+                              for path, s in zip(self._tls_paths, stats))
             if signature == self._tls_signature:
                 return
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -115,7 +124,7 @@ def handler_factory(control, *, web_root=WEB_ROOT):
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Referrer-Policy', 'same-origin')
             self.send_header('X-Frame-Options', 'DENY')
-            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+            self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; manifest-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
             for key, value in (extra or {}).items():
                 self.send_header(key, value)
             self.end_headers()
@@ -164,6 +173,26 @@ def handler_factory(control, *, web_root=WEB_ROOT):
                     return self.send(control.state())
                 if path == '/api/fleet':
                     return self.send(control.fleet_state())
+                if path == '/api/fleet/item':
+                    return self.send(control.fleet_item(p.get('id', '')))
+                if path == '/api/fleet/report':
+                    item = control.fleet_item(p.get('id', ''))['item']
+                    return self.send(item, extra={'Content-Disposition': 'attachment; filename="' + item['id'] + '.json"'})
+                if path == '/api/fleet/files':
+                    return self.send(control.fleet_files(p.get('id', '')))
+                if path == '/api/repository-access':
+                    return self.send(control.repository_access(p.get('repo', '')))
+                if path == '/api/watch-destinations':
+                    return self.send(control.watch_destinations(p.get('repo', ''), p.get('account')))
+                if path == '/api/rules':
+                    return self.send(control.inspect_rules(p.get('repo', '')))
+                if path == '/api/learn/sessions':
+                    control.member_home(p.get('account', ''))
+                    return self.send({'items': control.learning().list_sessions(p.get('account', ''))})
+                if path == '/api/learn/transcript':
+                    from .learning import LearningEngine
+                    session = control.learning_get(p.get('id', ''))['session']
+                    return self.send(LearningEngine.transcript(session).encode(), content_type='text/markdown; charset=utf-8', extra={'Content-Disposition': 'attachment; filename="lesson-' + session['id'] + '.md"'})
                 if path == '/api/explore/catalog':
                     return self.send(control.explore_catalog())
                 if path == '/api/explore':
@@ -214,6 +243,13 @@ def handler_factory(control, *, web_root=WEB_ROOT):
                     raise ApiError('This application page or operation was not found.', 404)
                 if path in {'/', '/index.html'}:
                     target = web_root / 'index.html'
+                elif path in {'/favicon.ico', '/favicon.svg', '/favicon-16x16.png',
+                              '/favicon-32x32.png', '/apple-touch-icon.png',
+                              '/icon-192.png', '/icon-512.png', '/manifest.webmanifest',
+                              '/brand/fatchin-logo.png'}:
+                    target = (web_root / path.lstrip('/')).resolve()
+                    if not target.is_relative_to(web_root.resolve()):
+                        raise ApiError('Asset not found.', 404)
                 elif path.startswith('/static/'):
                     target = (web_root / unquote(path[len('/static/'):])).resolve()
                     if not target.is_relative_to(web_root.resolve()) or any(part.startswith('.') for part in target.relative_to(web_root.resolve()).parts):
@@ -221,14 +257,16 @@ def handler_factory(control, *, web_root=WEB_ROOT):
                 elif path.startswith('/docs/'):
                     name = path.rsplit('/', 1)[-1]
                     if name not in {'GUI-GUIDE.md', 'GUI-OPERATIONS.md', 'GUI-CAPABILITIES.md', 'GUI-ACCEPTANCE.md',
-                                    'EXPLORE-AND-LEARN.md', 'GITHUB-EXPLORER-FACTS.md'}:
+                                    'EXPLORE-AND-LEARN.md', 'GITHUB-EXPLORER-FACTS.md', 'WORKFLOW.md', 'AGENT-FLEET.md'}:
                         raise ApiError('Guide not found.', 404)
                     target = WEB_ROOT.parent / 'docs' / name
                 else:
                     raise ApiError('Page not found.', 404)
                 if not target.is_file():
                     raise ApiError('This interface asset is not installed. Reinstall the matching GUI package.', 503)
-                mime = mimetypes.guess_type(str(target))[0] or 'application/octet-stream'
+                mime = {'.ico': 'image/vnd.microsoft.icon', '.svg': 'image/svg+xml',
+                        '.png': 'image/png', '.webmanifest': 'application/manifest+json'}.get(
+                            target.suffix, mimetypes.guess_type(str(target))[0] or 'application/octet-stream')
                 if target.suffix == '.md':
                     mime = 'text/plain; charset=utf-8'
                 self.send(target.read_bytes(), content_type=mime)
@@ -259,12 +297,18 @@ def handler_factory(control, *, web_root=WEB_ROOT):
                            '/api/repos': control.save_repo, '/api/repos/remove': control.remove_repo,
                            '/api/settings': control.save_settings, '/api/watches': control.add_watch,
                            '/api/service': control.service_action, '/api/provider-check': control.provider_check,
-                           '/api/credentials': control.credential, '/api/authority': control.set_authority}
+                           '/api/credentials': control.credential, '/api/authority': control.set_authority,
+                           '/api/provider-source': control.set_provider_source,
+                           '/api/watches/edit': control.edit_watch}
                 if path in actions:
                     return self.send(actions[path](body))
                 if path == '/api/fleet':
                     return self.send(control.fleet_action(body))
                 if path == '/api/learn':
+                    if body.get('action') == 'destination':
+                        output = control.destination(body)
+                        session = control.learning().change_destination(body.get('id', ''), body.get('account', ''), output, body.get('revision'))
+                        return self.send({'session': session, 'hint': 'The transcript destination changed. Your lesson and previous exports are kept.'})
                     return self.send(control.learning_action(body))
                 if path == '/api/github/connect':
                     return self.send(control.connect_github())
@@ -273,12 +317,13 @@ def handler_factory(control, *, web_root=WEB_ROOT):
                     if body.get('mode') not in {'all', 'selected'}:
                         raise ApiError('Choose the selected or all-pull-request watch to remove.')
                     number = '*' if body.get('mode') == 'all' else target_number(body.get('number'))
-                    control.watches().remove(repo, number)
-                    return self.send({'ok': True})
+                    return self.send(control.stop_watch(body))
                 if path.startswith('/api/jobs/'):
                     parts = path.strip('/').split('/')
                     if len(parts) == 4 and parts[3] in {'stop', 'retry'}:
                         return self.send(control.job_action(parts[2], parts[3]))
+                    if len(parts) == 4 and parts[3] == 'recovery':
+                        return self.send(control.job_recovery(parts[2], body))
                     if len(parts) == 4 and parts[3] == 'draft-action':
                         return self.send(control.draft_action(parts[2], body))
                 raise ApiError('This operation was not found.', 404)
@@ -286,7 +331,7 @@ def handler_factory(control, *, web_root=WEB_ROOT):
                 self.error(error)
 
         def error(self, error):
-            if isinstance(error, ApiError):
+            if isinstance(error, (ApiError, LearningError)):
                 status, message = error.status, str(error)
             elif isinstance(error, GitHubError):
                 status, message = 502, 'GitHub could not complete this request. Check your connection, repository access, and GitHub rate limits, then retry.'
@@ -295,9 +340,8 @@ def handler_factory(control, *, web_root=WEB_ROOT):
                 print(f'FatChin error {type(error).__name__}', file=sys.stderr)
             try:
                 self.send({'error': redact_text(message),
-                           'hint': 'Fix the problem named above and try again; '
-                                   'Connection checks explain GitHub access issues.',
-                           'actions_available': ['reload', 'diagnostics']}, status)
+                           'hint': getattr(error, 'hint', '') or 'Your saved work is kept. You can refresh its status, open setup checks, or change the request named above.',
+                           'actions_available': getattr(error, 'actions', None) or ['reload', 'diagnostics', 'help']}, status)
             except (BrokenPipeError, ConnectionResetError):
                 pass
 
