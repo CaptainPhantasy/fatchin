@@ -1,8 +1,10 @@
 """Tests for the pre-commit secret gate (stdlib only).
 
-Credential-shaped fixtures are assembled by concatenation so this file never
-contains a complete literal token. That keeps the repository's own file clean
-for GitHub's push protection and for the gate itself.
+The fixtures are deterministic synthetic values used only by local scanner
+assertions, never supplied credentials or authentication inputs. Concatenation
+preserves token shapes for these tests; it does not establish that a value is
+safe. Review third-party findings individually and retain the evidence and
+recorded test-credential classification. Keep scanning enabled for these files.
 """
 from __future__ import annotations
 
